@@ -241,13 +241,19 @@ def atom_records_from_coords(
     # create lookup for atom names
     bt_names = numpy.array([bt.name3 for bt in pbt.active_block_types])
     bt_atom_names = numpy.empty((pbt.n_types, pbt.max_n_atoms), dtype=object)
+    bt_atom_elements = numpy.empty((pbt.n_types, pbt.max_n_atoms), dtype=object)
+    atype_element = {atype.name: atype.element for atype in pbt.chem_db.atom_types}
     for i, bt in enumerate(pbt.active_block_types):
         for j, at in enumerate(bt.atoms):
             bt_atom_names[i, j] = at.name
+            bt_atom_elements[i, j] = atype_element[at.atom_type]
 
     bt_for_real_atom = block_types64[pose_for_real_atom, block_for_real_atom]
     results["resn"] = bt_names[bt_for_real_atom]
     results["atomn"] = bt_atom_names[
+        bt_for_real_atom, block_local_atom_index_for_real_atom
+    ]
+    results["element"] = bt_atom_elements[
         bt_for_real_atom, block_local_atom_index_for_real_atom
     ]
     real_atom_coords = pose_like_coords[atom_is_real]
