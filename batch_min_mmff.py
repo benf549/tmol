@@ -422,9 +422,10 @@ def parse_args(argv=None):
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--apo", action="store_true", help="also minimize protein alone -> _apo.pdb")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--num-workers", "-j", type=int, default=1,
-                    help="parallel worker processes; each pinned to one GPU (multi-GPU sharding). "
-                         "Default 1. Set to the number of GPUs you want to use.")
+    ap.add_argument("--num-workers", "-j", type=int, default=0,
+                    help="parallel worker processes, each pinned to one GPU (multi-GPU sharding). "
+                         "0 (default) uses every visible GPU; N uses N workers, capped at the GPU "
+                         "count so a device is never oversubscribed.")
     ap.add_argument("--resume", action="store_true", help="skip complexes whose outputs exist")
     ap.add_argument("--manifest", default=None, help="optional CSV path for per-complex status")
     cg = ap.add_argument_group(
@@ -521,7 +522,13 @@ def main(argv=None):
 
     ndev = torch.cuda.device_count() if torch.cuda.is_available() else 0
     use_cuda = args.device.startswith("cuda") and ndev > 0
-    nworkers = max(1, args.num_workers) if use_cuda else 1
+    if use_cuda:
+        # num_workers == 0 -> use every visible GPU; otherwise honor the request but cap at the
+        # GPU count so the round-robin never puts >1 worker on a device (which would oversubscribe
+        # its memory and risk OOM).
+        nworkers = ndev if args.num_workers == 0 else min(max(1, args.num_workers), ndev)
+    else:
+        nworkers = 1
     nworkers = min(nworkers, len(paths)) if paths else 1
     frozen = [k.replace("freeze_", "") for k, v in constraints_from_args(args).items() if v]
     print(f"complexes={len(paths)}  workers={nworkers}  batch_size={args.batch_size}  "
