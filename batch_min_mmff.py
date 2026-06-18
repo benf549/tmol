@@ -19,7 +19,7 @@ substructure match before coordinates are injected into the canonical ligand arr
 Usage:
     python batch_min_mmff.py LIST.txt --smiles "<SMILES>" --out-dir DIR \
         [--res-name LIG] [--batch-size 8] [--apo] [--device cuda] \
-        [--solvent-resnames HOH,WAT,NA,CL,...] [--resume] [--manifest m.csv]
+        [--resume] [--manifest m.csv]
 
 Constraints: freeze atom categories during minimization via Cartesian coord_mask
 (True=movable, False=frozen). Toggles combine freely:
@@ -78,12 +78,6 @@ for _nt, _rep in [
 ]:
     _CompactDumper.add_representer(_nt, _rep)
 
-DEFAULT_SOLVENT = [
-    "HOH", "WAT", "DOD", "NA", "CL", "K", "MG", "CA", "ZN", "SO4", "PO4",
-    "ACT", "EDO", "GOL", "NO3", "BR", "IOD", "MN", "FE", "CU", "CD", "NI", "CO", "HG",
-]
-
-
 # --------------------------------------------------------------------------- #
 # Stage 0: one-time ligand parameterization
 # --------------------------------------------------------------------------- #
@@ -125,6 +119,12 @@ def _canonical_mol(smiles, seed=0xF00D):
 
 def _canonical_ligand_array(canon, res_name):
     """Canonical ligand AtomArray (+bonds) with generated names + MMFF94 charges."""
+    # MMFFGetMoleculeProperties and MolToMolBlock(kekulize=True) both kekulize the mol
+    # IN PLACE. load_ligand_ctx reuses `canon` as the substructure-match query in
+    # extract_complex, so mutating it here silently breaks GetSubstructMatch for some
+    # N-heterocycles (-> spurious "ligand does not fully match" passthrough). Work on a
+    # copy so the caller's mol keeps its aromatic perception.
+    canon = Chem.Mol(canon)
     props = AllChem.MMFFGetMoleculeProperties(canon)
     if props is None:
         raise ValueError("MMFF94 parameterization unavailable for this SMILES")
@@ -176,7 +176,7 @@ def _protein_to_biotite(protein_sel):
     return arr
 
 
-def extract_complex(pdb_path, ctx, solvent_resnames):
+def extract_complex(pdb_path, ctx):
     """Split + rebuild ligand chemistry; return combined + protein-only arrays."""
     ag = pr.parsePDB(str(pdb_path))
     if ag is None:
@@ -186,12 +186,9 @@ def extract_complex(pdb_path, ctx, solvent_resnames):
     if protein_sel is None:
         raise ValueError("no protein atoms")
 
-    sel = "hetero and not element H"
-    if solvent_resnames:
-        sel += " and not resname " + " ".join(solvent_resnames)
-    het = ag.select(sel)
+    het = ag.select("hetero and not element H")
     if het is None:
-        raise ValueError("no ligand hetero atoms (after solvent filter)")
+        raise ValueError("no ligand hetero atoms")
 
     lig_stream = io.StringIO()
     pr.writePDBStream(lig_stream, het)
@@ -428,8 +425,6 @@ def parse_args(argv=None):
     ap.add_argument("--num-workers", "-j", type=int, default=1,
                     help="parallel worker processes; each pinned to one GPU (multi-GPU sharding). "
                          "Default 1. Set to the number of GPUs you want to use.")
-    ap.add_argument("--solvent-resnames", default=",".join(DEFAULT_SOLVENT),
-                    help="comma-separated resnames to drop from the hetero selection")
     ap.add_argument("--resume", action="store_true", help="skip complexes whose outputs exist")
     ap.add_argument("--manifest", default=None, help="optional CSV path for per-complex status")
     cg = ap.add_argument_group(
@@ -468,7 +463,6 @@ def run_shard(paths, args, device_str, tmol_path, progress_queue=None):
         torch.cuda.set_device(device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    solvent = [s for s in args.solvent_resnames.split(",") if s]
 
     ctx = load_ligand_ctx(args.smiles, args.res_name, device, tmol_path)
     sfxn = tmol.beta2016_score_function(device, param_db=ctx["lig_db"])
@@ -495,7 +489,7 @@ def run_shard(paths, args, device_str, tmol_path, progress_queue=None):
             raw = None
             try:
                 raw = Path(path).read_text()
-                ex = extract_complex(path, ctx, solvent)
+                ex = extract_complex(path, ctx)
                 holo_batch.append({"stem": stem, "pose": build_pose(ex["comb"], ctx), "raw": raw})
                 if args.apo:
                     apo_batch.append({"stem": stem, "pose": build_pose(ex["protein"], ctx), "raw": None})
