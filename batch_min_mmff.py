@@ -19,7 +19,12 @@ substructure match before coordinates are injected into the canonical ligand arr
 Usage:
     python batch_min_mmff.py LIST.txt --smiles "<SMILES>" --out-dir DIR \
         [--res-name LIG] [--batch-size 8] [--apo] [--device cuda] \
-        [--resume] [--manifest m.csv]
+        [--resume] [--manifest m.csv] [--no-opt-h] [--no-flip-nhq]
+
+OptH: by default each complex first goes through a discrete OptH / flip-HNQ pass
+(proton-chi placement + ASN/GLN/HIS flips at fixed heavy-atom coords, scored against
+the bound ligand) before the Cartesian minimizer refines all atoms. Disable with
+--no-opt-h, or keep proton optimization but skip the NHQ flips with --no-flip-nhq.
 
 Constraints: freeze atom categories during minimization via Cartesian coord_mask
 (True=movable, False=frozen). Toggles combine freely:
@@ -60,6 +65,10 @@ from tmol.io.pose_stack_construction import pose_stack_from_canonical_form
 from tmol.pose.pose_stack_builder import PoseStackBuilder
 from tmol.io.write_pose_stack_pdb import atom_records_from_pose_stack
 from tmol.io.pdb_parsing import to_pdb
+from tmol.pack.build_missing_sidechains import build_missing_sidechains
+from tmol.pack.rotamer.dunbrack.dunbrack_chi_sampler import (
+    create_dunbrack_sampler_from_database,
+)
 
 pr.confProDy(verbosity="none")
 
@@ -348,12 +357,42 @@ def _write_poses_per_model(pose_stack, stems, suffix, out_dir):
         _atomic_write(out_dir / f"{stem}{suffix}.pdb", to_pdb(sub))
 
 
-def _cart_min(stacked, sfxn, constraints):
+def optimize_hydrogens(stacked, sfxn, dunbrack_sampler, flip_nhq):
+    """OptH / flip-HNQ pre-pass: discretely optimize proton placement (and, with
+    flip_nhq, ASN/GLN/HIS flips) at fixed heavy-atom coords via pack_rotamers,
+    before the continuous Cartesian minimization refines everything.
+
+    Heavy atoms are kept at their input positions (NHQ flips excepted, which swap
+    the amide/ring heavy atoms by design). The bound ligand is present in the pose,
+    so its H-bond acceptors/donors shape the protein proton network. Reuses the
+    tested build_missing_sidechains path with an all-False block_has_missing_atoms
+    (these complexes are already complete designs), so every real block gets the
+    OptHSampler and the ligand falls back to its input conformation.
+    """
+    n_poses = stacked.coords.shape[0]
+    block_has_missing_atoms = torch.zeros(
+        (n_poses, stacked.max_n_blocks), dtype=torch.bool, device=stacked.device
+    )
+    return build_missing_sidechains(
+        stacked, sfxn, dunbrack_sampler, block_has_missing_atoms,
+        stacked.packed_block_types.restype_set, no_optH=False, flip_nhq=flip_nhq,
+    )
+
+
+def _cart_min(stacked, sfxn, constraints, opth=None):
     """run_cart_min with an optional freeze mask. Returns (minimized_pose, status).
+
+    When ``opth`` is given ({"dunbrack_sampler", "flip_nhq"}), an OptH / flip-HNQ
+    discrete proton-placement pass runs first, then the Cartesian minimizer refines
+    the result.
 
     status is "" normally, or "noop_all_frozen" when the constraints leave zero
     movable atoms (we skip the optimizer and return the input pose unchanged).
     """
+    if opth is not None:
+        stacked = optimize_hydrogens(
+            stacked, sfxn, opth["dunbrack_sampler"], opth["flip_nhq"]
+        )
     coord_mask = build_constraint_coord_mask(stacked, **constraints) if constraints else None
     if coord_mask is not None and not bool(coord_mask.any()):
         return stacked, "noop_all_frozen"
@@ -361,7 +400,7 @@ def _cart_min(stacked, sfxn, constraints):
 
 
 def minimize_and_write(batch, ctx, sfxn, suffix, out_dir, manifest, passthrough_on_fail,
-                       constraints=None):
+                       constraints=None, opth=None):
     """batch: list of dicts {stem, pose, raw}. Batched min, fall back per-pose."""
     if not batch:
         return
@@ -371,7 +410,7 @@ def minimize_and_write(batch, ctx, sfxn, suffix, out_dir, manifest, passthrough_
     try:
         stacked = PoseStackBuilder.from_poses(poses, device)
         e0 = _energies(sfxn, stacked)
-        mn, status = _cart_min(stacked, sfxn, constraints)
+        mn, status = _cart_min(stacked, sfxn, constraints, opth)
         e1 = _energies(sfxn, mn)
         _write_poses_per_model(mn, stems, suffix, out_dir)
         tag = f"minimized{suffix}" if not status else f"{status}{suffix}"
@@ -385,7 +424,7 @@ def minimize_and_write(batch, ctx, sfxn, suffix, out_dir, manifest, passthrough_
             try:
                 single = PoseStackBuilder.from_poses([b["pose"]], device)
                 e0 = float(_energies(sfxn, single)[0])
-                mn, status = _cart_min(single, sfxn, constraints)
+                mn, status = _cart_min(single, sfxn, constraints, opth)
                 e1 = float(_energies(sfxn, mn)[0])
                 _write_poses_per_model(mn, [b["stem"]], suffix, out_dir)
                 tag = f"minimized{suffix}" if not status else f"{status}{suffix}"
@@ -428,6 +467,14 @@ def parse_args(argv=None):
                          "count so a device is never oversubscribed.")
     ap.add_argument("--resume", action="store_true", help="skip complexes whose outputs exist")
     ap.add_argument("--manifest", default=None, help="optional CSV path for per-complex status")
+    og = ap.add_argument_group("hydrogen optimization (OptH / flip-HNQ)")
+    og.add_argument("--opt-h", dest="opt_h", action="store_true", default=True,
+                    help="run an OptH proton-placement + ASN/GLN/HIS-flip pass before "
+                         "Cartesian minimization (default: on)")
+    og.add_argument("--no-opt-h", dest="opt_h", action="store_false",
+                    help="disable the OptH pre-pass (minimize H positions continuously only)")
+    og.add_argument("--no-flip-nhq", dest="flip_nhq", action="store_false", default=True,
+                    help="within OptH, do not sample ASN/GLN/HIS flips (proton chis only)")
     cg = ap.add_argument_group(
         "constraints (freeze atom categories during minimization; combine freely)")
     cg.add_argument("--freeze-backbone", action="store_true",
@@ -469,16 +516,26 @@ def run_shard(paths, args, device_str, tmol_path, progress_queue=None):
     sfxn = tmol.beta2016_score_function(device, param_db=ctx["lig_db"])
     constraints = constraints_from_args(args)
 
+    # OptH / flip-HNQ pre-pass context (None = disabled). The Dunbrack sampler is only
+    # exercised for blocks with missing heavy atoms (none here), but build_missing_sidechains
+    # requires it, so build it once per shard.
+    opth = None
+    if args.opt_h:
+        opth = {
+            "dunbrack_sampler": create_dunbrack_sampler_from_database(ctx["lig_db"], device),
+            "flip_nhq": args.flip_nhq,
+        }
+
     holo_batch, apo_batch, manifest = [], [], []
 
     def flush(force=False):
         if force or len(holo_batch) >= args.batch_size:
             minimize_and_write(holo_batch, ctx, sfxn, "_holo", out_dir, manifest, True,
-                               constraints)
+                               constraints, opth)
             holo_batch.clear()
         if args.apo and (force or len(apo_batch) >= args.batch_size):
             minimize_and_write(apo_batch, ctx, sfxn, "_apo", out_dir, manifest, False,
-                               constraints)
+                               constraints, opth)
             apo_batch.clear()
 
     for path in paths:
@@ -531,8 +588,9 @@ def main(argv=None):
         nworkers = 1
     nworkers = min(nworkers, len(paths)) if paths else 1
     frozen = [k.replace("freeze_", "") for k, v in constraints_from_args(args).items() if v]
+    opth_desc = ("flip-HNQ" if args.flip_nhq else "proton-chi-only") if args.opt_h else "off"
     print(f"complexes={len(paths)}  workers={nworkers}  batch_size={args.batch_size}  "
-          f"apo={args.apo}  gpus_available={ndev}  "
+          f"apo={args.apo}  gpus_available={ndev}  opt_h={opth_desc}  "
           f"frozen={','.join(frozen) if frozen else 'none (all-atom)'}")
 
     # Parameterize the ligand ONCE (expensive) -> .tmol; workers load it cheaply.

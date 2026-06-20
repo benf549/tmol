@@ -16,6 +16,7 @@ def build_missing_sidechains(
     block_has_missing_atoms: Tensor[torch.bool][:, :],
     rts,
     no_optH: bool = False,
+    flip_nhq: bool = True,
 ) -> PoseStack:
     """Build missing sidechains and place hydrogens using per-block sampler assignment.
 
@@ -45,6 +46,9 @@ def build_missing_sidechains(
             for blocks that have missing non-leaf (heavy) atoms.
         rts: ResidueTypeSet (unused directly; kept for API compatibility).
         no_optH: When True, skip OptH and preserve old Dunbrack-only behavior.
+        flip_nhq: When True (default), OptH also samples ASN/GLN/HIS(/HIS_D)
+            flip rotamers (180-degree amide/ring flips) in addition to proton
+            chis.  Ignored when no_optH=True.
 
     Returns:
         PoseStack with missing sidechains built and (by default) hydrogens
@@ -58,7 +62,7 @@ def build_missing_sidechains(
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
-    opth_sampler = None if no_optH else OptHSampler()
+    opth_sampler = None if no_optH else OptHSampler(flip_NHQ=flip_nhq)
 
     for pose_ind in range(block_has_missing_atoms.size(0)):
         for block_ind in range(block_has_missing_atoms.size(1)):
