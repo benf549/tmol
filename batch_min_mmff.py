@@ -366,10 +366,10 @@ def _write_poses_per_model(pose_stack, stems, suffix, out_dir):
         _atomic_write(out_dir / f"{stem}{suffix}.pdb", to_pdb(sub))
 
 
-def optimize_hydrogens(stacked, sfxn, dunbrack_sampler, flip_nhq):
-    """OptH / flip-HNQ pre-pass: discretely optimize proton placement (and, with
-    flip_nhq, ASN/GLN/HIS flips) at fixed heavy-atom coords via pack_rotamers,
-    before the continuous Cartesian minimization refines everything.
+def optimize_hydrogens(stacked, sfxn, dunbrack_sampler):
+    """OptH / flip-HNQ pre-pass: discretely optimize proton placement AND
+    ASN/GLN/HIS(-D) flips at fixed heavy-atom coords via pack_rotamers, before the
+    continuous Cartesian minimization refines everything.
 
     Heavy atoms are kept at their input positions (NHQ flips excepted, which swap
     the amide/ring heavy atoms by design). The bound ligand is present in the pose,
@@ -377,14 +377,19 @@ def optimize_hydrogens(stacked, sfxn, dunbrack_sampler, flip_nhq):
     tested build_missing_sidechains path with an all-False block_has_missing_atoms
     (these complexes are already complete designs), so every real block gets the
     OptHSampler and the ligand falls back to its input conformation.
+
+    On uw-ipd/tmol master the NHQ-flip toggle moved out of build_missing_sidechains
+    and into OptHSampler(flip_NHQ=...), which build_missing_sidechains constructs
+    with its default (flip_NHQ=True) -- matching the pipeline's always-on flip
+    default. The old branch's 5th positional `restype_set` and `flip_nhq=` kwarg are
+    gone from the master signature; --no-flip-nhq is rejected up front (see main()).
     """
     n_poses = stacked.coords.shape[0]
     block_has_missing_atoms = torch.zeros(
         (n_poses, stacked.max_n_blocks), dtype=torch.bool, device=stacked.device
     )
     return build_missing_sidechains(
-        stacked, sfxn, dunbrack_sampler, block_has_missing_atoms,
-        stacked.packed_block_types.restype_set, no_optH=False, flip_nhq=flip_nhq,
+        stacked, sfxn, dunbrack_sampler, block_has_missing_atoms, no_optH=False,
     )
 
 
@@ -399,9 +404,7 @@ def _cart_min(stacked, sfxn, constraints, opth=None):
     movable atoms (we skip the optimizer and return the input pose unchanged).
     """
     if opth is not None:
-        stacked = optimize_hydrogens(
-            stacked, sfxn, opth["dunbrack_sampler"], opth["flip_nhq"]
-        )
+        stacked = optimize_hydrogens(stacked, sfxn, opth["dunbrack_sampler"])
     coord_mask = build_constraint_coord_mask(stacked, **constraints) if constraints else None
     if coord_mask is not None and not bool(coord_mask.any()):
         return stacked, "noop_all_frozen"
@@ -532,7 +535,6 @@ def run_shard(paths, args, device_str, tmol_path, progress_queue=None):
     if args.opt_h:
         opth = {
             "dunbrack_sampler": create_dunbrack_sampler_from_database(ctx["lig_db"], device),
-            "flip_nhq": args.flip_nhq,
         }
 
     holo_batch, apo_batch, manifest = [], [], []
@@ -579,6 +581,12 @@ def run_shard(paths, args, device_str, tmol_path, progress_queue=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if not args.flip_nhq:
+        sys.exit(
+            "--no-flip-nhq is not supported on this tmol build: master's "
+            "build_missing_sidechains no longer exposes the NHQ-flip toggle "
+            "(it always constructs OptHSampler with flip_NHQ=True). Drop the flag."
+        )
     paths = read_list(args.list)
 
     stems = [Path(p).stem for p in paths]
