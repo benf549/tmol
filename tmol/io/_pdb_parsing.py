@@ -43,6 +43,7 @@ atom_record_dtype = numpy.dtype(
         ("insert", str, 1),
         ("occupancy", float),
         ("b", float),
+        ("element", str, 2),
     ]
 )
 
@@ -219,10 +220,11 @@ def to_atom_lines(atom_records):
             z=r["z"],
             occupancy=r["occupancy"],
             b=r["b"],
+            element=r["element"],
         )
 
 
 _atom_record_format = (
     "ATOM  {atomi:5d} {atomn:^4}{location:^1}{resn:3s} {chain:1}{resi:4d}{insert:1s}   "
-    "{x:8.3f}{y:8.3f}{z:8.3f}{occupancy:6.2f}{b:6.2f}\n"
+    "{x:8.3f}{y:8.3f}{z:8.3f}{occupancy:6.2f}{b:6.2f}          {element:>2s}\n"
 )
