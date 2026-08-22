@@ -264,6 +264,20 @@ def atom_records_from_coords(
     results["atomn"] = bt_atom_names[
         bt_for_real_atom, block_local_atom_index_for_real_atom
     ]
+
+    # element symbol (PDB cols 77-78) — mirror the atom-name lookup so every written PDB
+    # (apo, holo, ligand) carries an authoritative per-atom element. Without it the column is
+    # blank and a downstream ligand-burial parse (prody/RDKit) fails on blank elements. Same
+    # atom-type -> element map used by PackedBlockTypes.determine_h_atoms.
+    atype_element = {atype.name: atype.element for atype in pbt.chem_db.atom_types}
+    bt_atom_elements = numpy.empty((pbt.n_types, pbt.max_n_atoms), dtype=object)
+    for i, bt in enumerate(pbt.active_block_types):
+        for j, at in enumerate(bt.atoms):
+            bt_atom_elements[i, j] = atype_element[at.atom_type]
+    results["element"] = bt_atom_elements[
+        bt_for_real_atom, block_local_atom_index_for_real_atom
+    ]
+
     real_atom_coords = pose_like_coords[atom_is_real]
     results["x"] = real_atom_coords[:, 0]
     results["y"] = real_atom_coords[:, 1]
