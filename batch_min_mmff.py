@@ -56,7 +56,6 @@ from biotite.structure.io.mol import MOLFile
 
 import tmol
 from tmol.database import ParameterDatabase
-from tmol.ligand import prepare_ligands
 from tmol.io.pose_stack_from_biotite import (
     canonical_form_from_biotite,
     _derived_types_for_param_db,
@@ -149,20 +148,30 @@ def build_ligand_params(smiles, res_name, out_tmol):
     """EXPENSIVE, run ONCE in the parent: parameterize the ligand and write a
     .tmol params file that workers cheaply load (skips per-worker RDKit typing).
 
-    On uw-ipd/tmol master the ligand-prep pipeline is unified around a
-    SMILES -> OpenBabel mol2 -> MMFF94 step: prepare_ligands detects the
-    non-standard residue in the AtomArray, derives its SMILES, and generates the
-    authoritative MMFF94 partial charges itself (there is no RDKit/Gasteiger
-    charge fallback, and the old branch's charge_mode="auto" kwarg is gone). The
-    RDKit partial_charge annotation carried on lig_arr is therefore ignored by
-    prepare_ligands; charges written to the .tmol come from OpenBabel.
+    Protomer fidelity: the ``--smiles`` we are given IS the protomer source of
+    truth (the pipeline designs to it), so we must NOT let ligand prep re-titrate
+    it. The old path routed through prepare_ligands(atom_array), which re-derives a
+    SMILES from the array and pKa-protonates it with Dimorphite-DL at pH 7.4 -- that
+    silently neutralized charged aromatic rings (e.g. benzimidazolium/pyrazolium
+    protomers lost a ring N-H: .tmol block type came out 1 atom short of the SMILES,
+    which then dropped a proton at pose-build and later crashed bunsalyze). See the
+    `tmol-opth-neutralizes-ligand-protomer` finding.
+
+    Fix: go straight from the verbatim SMILES with ``protonate=False`` (no Dimorphite;
+    "pin the already-protonated SMILES verbatim"), which still generates authoritative
+    OpenBabel MMFF94 charges -- only the pH normalization is skipped. This keeps the
+    .tmol block type in lockstep with the RDKit `canon` that load_ligand_ctx builds
+    from the same SMILES, so the full protomer survives to the output holo.
     """
-    _, canon = _canonical_mol(smiles)
-    lig_arr = _canonical_ligand_array(canon, res_name)
-    prepare_ligands(
-        lig_arr.copy(), param_db=ParameterDatabase.get_default(),
-        params_output=str(out_tmol),
+    from tmol.ligand.detect import nonstandard_residue_info_from_smiles_via_mol2
+    from tmol.ligand.preparation import prepare_single_ligand
+    from tmol.ligand.params_io import write_params_file
+
+    info = nonstandard_residue_info_from_smiles_via_mol2(
+        smiles, res_name=res_name, protonate=False,
     )
+    prep = prepare_single_ligand(info, sample_proton_chi=True)
+    write_params_file(prep, str(out_tmol), format="tmol")
 
 
 def load_ligand_ctx(smiles, res_name, device, tmol_path):
