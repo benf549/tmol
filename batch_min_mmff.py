@@ -56,16 +56,16 @@ from biotite.structure.io.mol import MOLFile
 
 import tmol
 from tmol.database import ParameterDatabase
-from tmol.io.pose_stack_from_biotite import (
+from tmol.io._pose_stack_from_biotite import (
     canonical_form_from_biotite,
     _derived_types_for_param_db,
 )
-from tmol.io.pose_stack_construction import pose_stack_from_canonical_form
-from tmol.pose.pose_stack_builder import PoseStackBuilder
-from tmol.io.write_pose_stack_pdb import atom_records_from_pose_stack
-from tmol.io.pdb_parsing import to_pdb
-from tmol.pack.build_missing_sidechains import build_missing_sidechains
-from tmol.pack.rotamer.dunbrack.dunbrack_chi_sampler import (
+from tmol.io._pose_stack_construction import pose_stack_from_canonical_form
+from tmol.pose._pose_stack_builder import PoseStackBuilder
+from tmol.io._write_pose_stack_pdb import atom_records_from_pose_stack
+from tmol.io._pdb_parsing import to_pdb
+from tmol.pack._build_missing_sidechains import build_missing_sidechains
+from tmol.pack.rotamer.dunbrack._dunbrack_chi_sampler import (
     create_dunbrack_sampler_from_database,
 )
 
@@ -74,7 +74,7 @@ pr.confProDy(verbosity="none")
 # tmol's .tmol (YAML) writer uses a custom _CompactDumper that cannot represent
 # numpy scalar types. Atom names/charges that pass through biotite arrays arrive as
 # numpy scalars, so register representers that coerce them to native Python types.
-from tmol.ligand.params_io import _CompactDumper as _CompactDumper  # noqa: E402
+from tmol.ligand._params_io import _CompactDumper as _CompactDumper  # noqa: E402
 
 for _nt, _rep in [
     (np.str_, lambda d, x: d.represent_str(str(x))),
@@ -163,9 +163,9 @@ def build_ligand_params(smiles, res_name, out_tmol):
     .tmol block type in lockstep with the RDKit `canon` that load_ligand_ctx builds
     from the same SMILES, so the full protomer survives to the output holo.
     """
-    from tmol.ligand.detect import nonstandard_residue_info_from_smiles_via_mol2
-    from tmol.ligand.preparation import prepare_single_ligand
-    from tmol.ligand.params_io import write_params_file
+    from tmol.ligand._detect import nonstandard_residue_info_from_smiles_via_mol2
+    from tmol.ligand._preparation import prepare_single_ligand
+    from tmol.ligand._params_io import write_params_file
 
     info = nonstandard_residue_info_from_smiles_via_mol2(
         smiles, res_name=res_name, protonate=False,
@@ -176,7 +176,7 @@ def build_ligand_params(smiles, res_name, out_tmol):
 
 def load_ligand_ctx(smiles, res_name, device, tmol_path):
     """CHEAP per-worker: load the prebuilt .tmol and rebuild the matching context."""
-    from tmol.ligand.params_file import inject_params_file
+    from tmol.ligand._params_file import inject_params_file
     smimol, canon = _canonical_mol(smiles)
     lig_arr = _canonical_ligand_array(canon, res_name)
     lig_db = inject_params_file(ParameterDatabase.get_default(), str(tmol_path))
