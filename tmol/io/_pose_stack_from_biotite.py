@@ -540,9 +540,22 @@ def _map_atoms_to_canonical(co, atom_res_inds, res_names, atom_names):
     atom_inds = []
     valid = []
     unmapped: dict[str, list[str]] = {}
+    # Case-insensitive fallback map per residue type, built lazily. Biotite's MOL/PDB
+    # reader uppercases two-letter element symbols (chlorine "Cl1" -> "CL1"), so an
+    # exact, case-sensitive lookup misses it against the canonical "Cl1" and the atom's
+    # input coordinate is silently dropped (-> NaN -> rebuilt from ideal icoors at a
+    # wrong dihedral). Fall back to a lowercased-name match so Cl, Br, and other
+    # two-letter-element atoms map correctly (single-letter elements are unaffected).
+    ci_mapping: dict[str, dict[str, int]] = {}
     for i, (resname, atname) in enumerate(zip(res_names, atom_names)):
         mapping = co.restypes_atom_index_mapping.get(resname, {})
         idx = mapping.get(atname, -1)
+        if idx < 0:
+            ci = ci_mapping.get(resname)
+            if ci is None:
+                ci = {k.lower(): v for k, v in mapping.items()}
+                ci_mapping[resname] = ci
+            idx = ci.get(atname.lower(), -1)
         atom_inds.append(idx)
         valid.append(idx >= 0)
         if idx < 0:
