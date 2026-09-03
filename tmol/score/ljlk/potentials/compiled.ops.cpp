@@ -5,9 +5,8 @@
 #include <tmol/utility/tensor/context_manager.hh>
 #include <tmol/utility/function_dispatch/aten.hh>
 
-#include <tmol/score/common/simple_dispatch.hh>
-#include <tmol/score/common/forall_dispatch.hh>
 #include <tmol/score/common/device_operations.hh>
+#include <tmol/score/common/whole_pose_scoring.hh>
 
 #include "ljlk_pose_score.hh"
 // #include "rotamer_pair_energy_lj.hh"
@@ -59,6 +58,7 @@ class LJLKPoseScoreOp
       Tensor block_type_n_interblock_bonds,
       Tensor block_type_atoms_forming_chemical_bonds,
       Tensor block_type_path_distance,
+      Tensor block_type_is_ligand_fragment,
 
       Tensor type_params,
       Tensor global_params,
@@ -101,6 +101,7 @@ class LJLKPoseScoreOp
                   TCAST(block_type_n_interblock_bonds),
                   TCAST(block_type_atoms_forming_chemical_bonds),
                   TCAST(block_type_path_distance),
+                  TCAST(block_type_is_ligand_fragment),
 
                   TCAST(type_params),
                   TCAST(global_params),
@@ -142,6 +143,7 @@ class LJLKPoseScoreOp
            block_type_n_interblock_bonds,
            block_type_atoms_forming_chemical_bonds,
            block_type_path_distance,
+           block_type_is_ligand_fragment,
 
            type_params,
            global_params,
@@ -161,15 +163,10 @@ class LJLKPoseScoreOp
     // use the number of stashed variables to determine if we are in
     //   block-pair scoring mode or single-score mode
     if (saved.size() == 2) {
-      // TO DO: make this a function so it's not duplicated everywhere
       // single-score mode
-      auto saved_grads = ctx->get_saved_variables();
-      auto saved_grad = saved_grads[0];
-      auto pose_ind_for_atom = saved_grads[1];
-      auto atom_ingrads =
-          grad_outputs[0].index_select(1, pose_ind_for_atom).unsqueeze(-1);
-
-      dV_d_pose_coords = saved_grad * atom_ingrads;
+      auto saved_grad = saved[0];
+      dV_d_pose_coords =
+          common::accumulate_whole_pose_gradients(saved_grad, grad_outputs[0]);
     } else {
       // block-pair mode
       int i = 0;
@@ -200,6 +197,7 @@ class LJLKPoseScoreOp
       auto block_type_n_interblock_bonds = saved[i++];
       auto block_type_atoms_forming_chemical_bonds = saved[i++];
       auto block_type_path_distance = saved[i++];
+      auto block_type_is_ligand_fragment = saved[i++];
 
       auto type_params = saved[i++];
       auto global_params = saved[i++];
@@ -246,6 +244,7 @@ class LJLKPoseScoreOp
                     TCAST(block_type_n_interblock_bonds),
                     TCAST(block_type_atoms_forming_chemical_bonds),
                     TCAST(block_type_path_distance),
+                    TCAST(block_type_is_ligand_fragment),
 
                     TCAST(type_params),
                     TCAST(global_params),
@@ -271,7 +270,7 @@ class LJLKPoseScoreOp
             torch::Tensor(),  torch::Tensor(),
 
             torch::Tensor(),  torch::Tensor(), torch::Tensor(),
-            torch::Tensor()};
+            torch::Tensor(),  torch::Tensor()};
   }
 };
 
@@ -306,6 +305,7 @@ class LJLKRotamerScoreOp
       Tensor block_type_n_interblock_bonds,
       Tensor block_type_atoms_forming_chemical_bonds,
       Tensor block_type_path_distance,
+      Tensor block_type_is_ligand_fragment,
 
       Tensor type_params,
       Tensor global_params,
@@ -348,6 +348,7 @@ class LJLKRotamerScoreOp
                   TCAST(block_type_n_interblock_bonds),
                   TCAST(block_type_atoms_forming_chemical_bonds),
                   TCAST(block_type_path_distance),
+                  TCAST(block_type_is_ligand_fragment),
 
                   TCAST(type_params),
                   TCAST(global_params),
@@ -389,6 +390,7 @@ class LJLKRotamerScoreOp
            block_type_n_interblock_bonds,
            block_type_atoms_forming_chemical_bonds,
            block_type_path_distance,
+           block_type_is_ligand_fragment,
 
            type_params,
            global_params,
@@ -446,6 +448,7 @@ class LJLKRotamerScoreOp
       auto block_type_n_interblock_bonds = saved[i++];
       auto block_type_atoms_forming_chemical_bonds = saved[i++];
       auto block_type_path_distance = saved[i++];
+      auto block_type_is_ligand_fragment = saved[i++];
 
       auto type_params = saved[i++];
       auto global_params = saved[i++];
@@ -492,6 +495,7 @@ class LJLKRotamerScoreOp
                     TCAST(block_type_n_interblock_bonds),
                     TCAST(block_type_atoms_forming_chemical_bonds),
                     TCAST(block_type_path_distance),
+                    TCAST(block_type_is_ligand_fragment),
 
                     TCAST(type_params),
                     TCAST(global_params),
@@ -517,7 +521,7 @@ class LJLKRotamerScoreOp
             torch::Tensor(),  torch::Tensor(),
 
             torch::Tensor(),  torch::Tensor(), torch::Tensor(),
-            torch::Tensor()};
+            torch::Tensor(),  torch::Tensor()};
   }
 };
 
@@ -548,6 +552,7 @@ std::vector<Tensor> ljlk_pose_scores_op(
     Tensor block_type_n_interblock_bonds,
     Tensor block_type_atoms_forming_chemical_bonds,
     Tensor block_type_path_distance,
+    Tensor block_type_is_ligand_fragment,
 
     Tensor ljlk_type_params,
     Tensor global_params,
@@ -579,6 +584,7 @@ std::vector<Tensor> ljlk_pose_scores_op(
       block_type_n_interblock_bonds,
       block_type_atoms_forming_chemical_bonds,
       block_type_path_distance,
+      block_type_is_ligand_fragment,
 
       ljlk_type_params,
       global_params,
@@ -613,6 +619,7 @@ std::vector<Tensor> ljlk_rotamer_scores_op(
     Tensor block_type_n_interblock_bonds,
     Tensor block_type_atoms_forming_chemical_bonds,
     Tensor block_type_path_distance,
+    Tensor block_type_is_ligand_fragment,
 
     Tensor ljlk_type_params,
     Tensor global_params,
@@ -644,6 +651,7 @@ std::vector<Tensor> ljlk_rotamer_scores_op(
       block_type_n_interblock_bonds,
       block_type_atoms_forming_chemical_bonds,
       block_type_path_distance,
+      block_type_is_ligand_fragment,
 
       ljlk_type_params,
       global_params,

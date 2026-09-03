@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from tmol.optimization.lbfgs_armijo import LBFGS_Armijo
+from tmol.optimization import LBFGS_Armijo
 
 
 class SimpleLJScore:
@@ -26,6 +26,36 @@ class SimpleLJScore:
         return self
 
 
+def test_lbfgs_requires_one_parameter_tensor():
+    x = torch.nn.Parameter(torch.zeros(1))
+    y = torch.nn.Parameter(torch.zeros(1))
+
+    with pytest.raises(ValueError, match="exactly one parameter tensor"):
+        LBFGS_Armijo([x, y])
+
+
+def test_lbfgs_accepts_one_named_parameter():
+    x = torch.nn.Parameter(torch.zeros(1))
+
+    optimizer = LBFGS_Armijo([("x", x)])
+
+    assert optimizer.param_groups[0]["params"][0] is x
+    assert optimizer.param_groups[0]["param_names"] == ["x"]
+
+
+def test_lbfgs_zero_grad_supports_both_reset_modes():
+    x = torch.nn.Parameter(torch.ones(2))
+    optimizer = LBFGS_Armijo([x])
+
+    x.sum().backward()
+    optimizer.zero_grad(set_to_none=False)
+    torch.testing.assert_close(x.grad, torch.zeros_like(x))
+
+    x.sum().backward()
+    optimizer.zero_grad()
+    assert x.grad is None
+
+
 def test_lbfgs_armijo():
     dtype = torch.float
     device = torch.device("cpu")
@@ -47,6 +77,22 @@ def test_lbfgs_armijo():
     score_stop = closure()
 
     assert score_start > score_stop
+
+
+def test_large_negative_gradient_does_not_converge():
+    x = torch.zeros(1, dtype=torch.float64, requires_grad=True)
+    optimizer = LBFGS_Armijo([x], max_iter=2, rtol=1e-6, atol=1e-6, gradtol=1.0)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = -10 * x.sum()
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    assert optimizer.state[x]["n_iter"] == 2
+    torch.testing.assert_close(x.grad, torch.tensor([-10.0], dtype=x.dtype))
 
 
 @pytest.mark.xfail(reason="sparse tensor _copy failure in torch 1.6")

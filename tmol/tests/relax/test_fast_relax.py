@@ -2,20 +2,28 @@ import torch
 import numpy
 import pytest
 
-from tmol.relax.fast_relax import _default_cart_min_fn, fast_relax
+from tmol.relax import _default_cart_min_fn, fast_relax
 import time
 
-from tmol.pose.pose_stack import PoseStack
-from tmol.pose.pose_stack_builder import PoseStackBuilder
-from tmol.score.score_function import ScoreFunction
-from tmol.score.score_types import ScoreType
-
-from tmol.pack.packer_task import PackerPalette
-from tmol.pack.rotamer.fixed_aa_chi_sampler import FixedAAChiSampler
-from tmol.pack.rotamer.include_current_sampler import IncludeCurrentSampler
-from tmol.kinematics.move_map import CartesianMoveMap, MoveMap
-from tmol.kinematics.fold_forest import EdgeType, FoldForest
-
+from tmol.pose import (
+    PoseStack,
+    PoseStackBuilder,
+)
+from tmol.score import (
+    ScoreFunction,
+    ScoreType,
+)
+from tmol.pack import PackerPalette
+from tmol.pack.rotamer import (
+    FixedAAChiSampler,
+    IncludeCurrentSampler,
+)
+from tmol.kinematics import (
+    CartesianMoveMap,
+    MoveMap,
+    EdgeType,
+    FoldForest,
+)
 from tmol.io import pose_stack_from_pdb
 
 
@@ -56,17 +64,17 @@ def test_fast_relax_ubq(default_database, ubq_pdb, dun_sampler, torch_device, n_
 
     pose_stack = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
     sfxn = get_relax_sfxn(default_database, torch_device)
-    restype_set = pose_stack.packed_block_types.restype_set
 
     mm = MoveMap.from_pose_stack(pose_stack)
     mm.move_all_jumps = True
     mm.move_all_named_torsions = True
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     fold_forest = FoldForest.reasonable_fold_forest(pose_stack)
 
     def task_op(task):
         task.restrict_to_repacking()
+        task.or_bump_check(True)
 
         fixed_sampler = FixedAAChiSampler()
         task.add_conformer_sampler(dun_sampler)
@@ -113,15 +121,15 @@ def test_cart_relax_ubq(default_database, ubq_pdb, dun_sampler, torch_device, n_
 
     pose_stack = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
     sfxn = get_relax_sfxn(default_database, torch_device)
-    restype_set = pose_stack.packed_block_types.restype_set
 
     # CartesianMoveMap with coord_mask=None moves all atoms.
     cart_mm = CartesianMoveMap()
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     fold_forest = FoldForest.reasonable_fold_forest(pose_stack)
 
     def task_op(task):
         task.restrict_to_repacking()
+        task.or_bump_check(True)
 
         fixed_sampler = FixedAAChiSampler()
         task.add_conformer_sampler(dun_sampler)
@@ -174,7 +182,6 @@ def test_fast_relax_pertuz(
 
     pose_stack = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
     sfxn = get_relax_sfxn(default_database, torch_device)
-    restype_set = pose_stack.packed_block_types.restype_set
 
     edges = numpy.array(
         [
@@ -202,10 +209,11 @@ def test_fast_relax_pertuz(
     )
     mm.move_all_named_torsions = True
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
 
     def task_op(task):
         task.restrict_to_repacking()
+        task.or_bump_check(True)
 
         fixed_sampler = FixedAAChiSampler()
         task.add_conformer_sampler(dun_sampler)
@@ -269,17 +277,17 @@ def test_fast_relax_for_different_shapes(
 
     pose_stack = PoseStackBuilder.from_poses([p1, p2, p3], torch_device)
     sfxn = get_relax_sfxn(default_database, torch_device)
-    restype_set = pose_stack.packed_block_types.restype_set
 
     fold_forest = FoldForest.reasonable_fold_forest(pose_stack)
     mm = MoveMap.from_pose_stack(pose_stack)
     mm.move_all_jumps = True
     mm.move_all_named_torsions = True
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
 
     def task_op(task):
         task.restrict_to_repacking()
+        task.or_bump_check(True)
 
         fixed_sampler = FixedAAChiSampler()
         task.add_conformer_sampler(dun_sampler)

@@ -1,35 +1,40 @@
 import attrs
+import pytest
 import torch
 import math
 
-from tmol.pose.constraint_set import ConstraintSet
-from tmol.pose.pose_stack_builder import PoseStackBuilder
-from tmol.score.score_function import ScoreFunction
-from tmol.score.score_types import ScoreType
-
-from tmol.pack.compiled.compiled import build_interaction_graph
-from tmol.pack.packer_task import PackerTask, PackerPalette
-from tmol.pack.rotamer.build_rotamers import build_rotamers
-from tmol.pack.rotamer.fixed_aa_chi_sampler import (
-    FixedAAChiSampler,
+from tmol.pose import (
+    ConstraintSet,
+    PoseStackBuilder,
 )
-from tmol.pack.rotamer.include_current_sampler import IncludeCurrentSampler
-from tmol.pack.rotamer.opth_sampler import OptHSampler
-from tmol.pack.datatypes import PackerEnergyTables
-from tmol.pack.simulated_annealing import run_simulated_annealing
-from tmol.pack.impose_rotamers import impose_top_rotamer_assignments
-
+from tmol.score import (
+    ScoreFunction,
+    ScoreType,
+)
+from tmol.pack.compiled import build_interaction_graph
+from tmol.pack import (
+    PackerTask,
+    PackerPalette,
+    SetPackerTask,
+    PackerEnergyTables,
+    run_simulated_annealing,
+    impose_top_rotamer_assignments,
+    pack_rotamers,
+)
+from tmol.pack.rotamer import (
+    build_rotamers,
+    FixedAAChiSampler,
+    IncludeCurrentSampler,
+    OptHSampler,
+)
 from tmol.io import pose_stack_from_pdb
 
-from tmol.pack.pack_rotamers import pack_rotamers
-
-from tmol.score.constraint.constraint_energy_term import ConstraintEnergyTerm
+from tmol.score.constraint import ConstraintEnergyTerm
 
 
 def setup_pose_stack_and_task(poses, torch_device, dun_sampler):
     pose_stack = PoseStackBuilder.from_poses(poses, torch_device)
-    restype_set = pose_stack.packed_block_types.restype_set
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(pose_stack, palette)
     task.restrict_to_repacking()
     task.add_conformer_sampler(IncludeCurrentSampler())
@@ -40,42 +45,118 @@ def setup_pose_stack_and_task(poses, torch_device, dun_sampler):
 
 
 def build_packer_energy_tables(pose_stack, rotamer_set, sfxn, chunk_size=16):
+    pbt = pose_stack.packed_block_types
     rotamer_scoring_module = sfxn.render_rotamer_scoring_module(pose_stack, rotamer_set)
     energies = rotamer_scoring_module(rotamer_set.coords).coalesce()
-    energy1b, chunk_pair_offset_for_block_pair, chunk_pair_offset, energy2b = (
-        build_interaction_graph(
-            chunk_size,
-            rotamer_set.n_rots_for_pose,
-            rotamer_set.rot_offset_for_pose,
-            rotamer_set.n_rots_for_block,
-            rotamer_set.rot_offset_for_block,
-            rotamer_set.pose_for_rot,
-            rotamer_set.block_type_ind_for_rot,
-            rotamer_set.block_ind_for_rot,
-            energies.indices().to(torch.int32),
-            energies.values(),
-        )
-    )
-    return PackerEnergyTables(
-        max_n_rotamers_per_pose=rotamer_set.max_n_rots_per_pose,
-        pose_n_res=pose_stack.n_res_per_pose,
-        pose_n_rotamers=rotamer_set.n_rots_for_pose,
-        pose_rotamer_offset=rotamer_set.rot_offset_for_pose,
-        nrotamers_for_res=rotamer_set.n_rots_for_block,
-        oneb_offsets=rotamer_set.rot_offset_for_block,
-        res_for_rot=rotamer_set.block_ind_for_rot,
-        chunk_size=chunk_size,
-        chunk_offset_offsets=chunk_pair_offset_for_block_pair,
-        chunk_offsets=chunk_pair_offset,
-        energy1b=energy1b,
-        energy2b=energy2b,
+
+    (
+        max_n_bump_checked_rotamers_per_pose_tensor,
+        n_molten_blocks_per_pose,
+        n_bc_rots_per_pose,
+        bc_rot_offset_for_pose,
+        n_bc_rots_for_molten_block,
+        bc_rot_offset_for_molten_block,
+        molten_block_ind_for_bc_rot,
+        rotamer_for_nonmolten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+        energy1b,
+        chunk_pair_offset_for_block_pair,
+        chunk_pair_offset,
+        energy2b,
+    ) = build_interaction_graph(
+        True,
+        chunk_size,
+        pbt.n_types,
+        rotamer_set.n_rots_for_pose,
+        rotamer_set.rot_offset_for_pose,
+        rotamer_set.n_rots_for_block,
+        rotamer_set.rot_offset_for_block,
+        rotamer_set.pose_for_rot,
+        rotamer_set.block_type_ind_for_rot,
+        rotamer_set.block_ind_for_rot,
+        energies.indices().to(torch.int32),
+        energies.values(),
+        False,
     )
 
+    # what else??!
+    return (
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+        PackerEnergyTables(
+            max_n_rotamers_per_pose=max_n_bump_checked_rotamers_per_pose_tensor.item(),
+            pose_n_res=n_molten_blocks_per_pose,
+            pose_n_rotamers=n_bc_rots_per_pose,
+            pose_rotamer_offset=bc_rot_offset_for_pose,
+            nrotamers_for_res=n_bc_rots_for_molten_block,
+            oneb_offsets=bc_rot_offset_for_molten_block,
+            res_for_rot=molten_block_ind_for_bc_rot,
+            chunk_size=chunk_size,
+            chunk_offset_offsets=chunk_pair_offset_for_block_pair,
+            chunk_offsets=chunk_pair_offset,
+            energy1b=energy1b,
+            energy2b=energy2b,
+        ),
+    )
 
-def run_pack_and_assert_scores(pose_stack, rotamer_set, packer_energy_tables, sfxn):
+    # energy1b, chunk_pair_offset_for_block_pair, chunk_pair_offset, energy2b = (
+    #     build_interaction_graph(
+    #         chunk_size,
+    #         rotamer_set.n_rots_for_pose,
+    #         rotamer_set.rot_offset_for_pose,
+    #         rotamer_set.n_rots_for_block,
+    #         rotamer_set.rot_offset_for_block,
+    #         rotamer_set.pose_for_rot,
+    #         rotamer_set.block_type_ind_for_rot,
+    #         rotamer_set.block_ind_for_rot,
+    #         energies.indices().to(torch.int32),
+    #         energies.values(),
+    #     )
+    # )
+    # return PackerEnergyTables(
+    #     max_n_rotamers_per_pose=rotamer_set.max_n_rots_per_pose,
+    #     pose_n_res=pose_stack.n_res_per_pose,
+    #     pose_n_rotamers=rotamer_set.n_rots_for_pose,
+    #     pose_rotamer_offset=rotamer_set.rot_offset_for_pose,
+    #     nrotamers_for_res=rotamer_set.n_rots_for_block,
+    #     oneb_offsets=rotamer_set.rot_offset_for_block,
+    #     res_for_rot=rotamer_set.block_ind_for_rot,
+    #     chunk_size=chunk_size,
+    #     chunk_offset_offsets=chunk_pair_offset_for_block_pair,
+    #     chunk_offsets=chunk_pair_offset,
+    #     energy1b=energy1b,
+    #     energy2b=energy2b,
+    # )
+
+
+def run_pack_and_assert_scores(
+    pose_stack,
+    rotamer_set,
+    packer_energy_tables,
+    sfxn,
+    rotamer_for_nonmolten_block,
+    n_molten_blocks_per_pose,
+    bc_rot_offset_for_molten_block,
+    bc_rot_to_orig_rot,
+    bg_bg_energies,
+):
     scores, rotamer_assignments = run_simulated_annealing(packer_energy_tables)
+
+    # correct for some residues being ignored as part of the background
+    scores = scores + bg_bg_energies.unsqueeze(1)
+
     new_pose_stack = impose_top_rotamer_assignments(
-        pose_stack, rotamer_set, rotamer_assignments
+        pose_stack,
+        rotamer_set,
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        rotamer_assignments,
     )
     wpsm = sfxn.render_whole_pose_scoring_module(new_pose_stack)
     new_scores = wpsm(new_pose_stack.coords)
@@ -119,19 +200,40 @@ def get_constraints_only_sfxn(default_database, torch_device):
     return sfxn
 
 
-def test_pack_rotamers(default_database, ubq_pdb, dun_sampler, torch_device):
+@pytest.mark.parametrize("chunk_size", [8, 16])
+def test_pack_rotamers(
+    default_database, ubq_pdb, dun_sampler, torch_device, chunk_size
+):
     n_poses = 4
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
     pose_stack, task = setup_pose_stack_and_task(
         [p] * n_poses, torch_device, dun_sampler
     )
+    task = SetPackerTask.from_packer_task(task)
+
     sfxn = get_packer_sfxn(default_database, torch_device)
     pose_stack, rotamer_set = build_rotamers(
         pose_stack, task, pose_stack.packed_block_types.chem_db
     )
-    packer_energy_tables = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
+    (
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+        packer_energy_tables,
+    ) = build_packer_energy_tables(pose_stack, rotamer_set, sfxn, chunk_size=chunk_size)
+
     _, _ = run_pack_and_assert_scores(
-        pose_stack, rotamer_set, packer_energy_tables, sfxn
+        pose_stack,
+        rotamer_set,
+        packer_energy_tables,
+        sfxn,
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
     )
 
 
@@ -139,13 +241,14 @@ def test_pack_rotamers_optH(default_database, ubq_pdb, torch_device):
     n_poses = 4
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
     pose_stack = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
-    restype_set = pose_stack.packed_block_types.restype_set
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(pose_stack, palette)
     task.restrict_to_repacking()
     task.add_conformer_sampler(IncludeCurrentSampler())
     task.add_conformer_sampler(OptHSampler())
     task.add_conformer_sampler(FixedAAChiSampler())
+    task = SetPackerTask.from_packer_task(task)
+
     sfxn = get_packer_sfxn(default_database, torch_device)
     pose_stack, rotamer_set = build_rotamers(
         pose_stack, task, pose_stack.packed_block_types.chem_db
@@ -153,37 +256,61 @@ def test_pack_rotamers_optH(default_database, ubq_pdb, torch_device):
 
     # NHQ flip rotamers must have chi either matching the input (~0 deg)
     # or flipped by ~180 deg.
-    from tmol.numeric.dihedrals import coord_dihedrals as _cd
+    from tmol.numeric import coord_dihedrals as _cd
 
-    pose_i = 0
-    for block_j, blt in enumerate(task.blts[pose_i]):
-        orig = blt.original_block_type
-        if not hasattr(orig, "opth_sampler_cache"):
-            continue
+    for i in range(task.allowed_bt_block_type.shape[0]):
+        pose_i = task.allowed_bt_pose[i].item()
+        block_i = task.allowed_bt_block[i].item()
+        orig_bt = task.per_block_orig_block_type[pose_i, block_i].item()
+        orig = pose_stack.packed_block_types.active_block_types[orig_bt]
+        assert hasattr(orig, "opth_sampler_cache")
         cache = orig.opth_sampler_cache
-        if cache.nhq_chi_col < 0:
-            continue
-        a4 = cache.nhq_chi_4atoms
-        off = int(pose_stack.block_coord_offset[pose_i, block_j].item())
-        c = pose_stack.coords[pose_i][[off + int(a4[k]) for k in range(4)]].double()
-        input_chi = float(_cd(c[0:1], c[1:2], c[2:3], c[3:4])[0])
-        n_rots = int(rotamer_set.n_rots_for_block[pose_i, block_j].item())
-        rot_off = int(rotamer_set.rot_offset_for_block[pose_i, block_j].item())
-        for r in range(n_rots):
-            co = int(rotamer_set.coord_offset_for_rot[rot_off + r].item())
-            rc4 = rotamer_set.coords[[co + int(a4[k]) for k in range(4)]].double()
-            rot_chi = float(_cd(rc4[0:1], rc4[1:2], rc4[2:3], rc4[3:4])[0])
-            delta = math.degrees(rot_chi - input_chi)
-            delta = (delta + 180.0) % 360.0 - 180.0
-            # assert deltas are only 0 or 180
-            assert min(abs(delta), abs(abs(delta) - 180.0)) < 1.0, (
-                f"res {block_j} ({orig.name3}) rot {r}: "
-                f"unexpected NHQ chi delta {delta:.2f} deg"
-            )
+        if cache.nhq_chi_col >= 0:
+            a4 = cache.nhq_chi_4atoms
+            off = int(pose_stack.block_coord_offset[pose_i, block_i].item())
+            c = pose_stack.coords[pose_i][[off + int(a4[k]) for k in range(4)]].double()
+            input_chi = float(_cd(c[0:1], c[1:2], c[2:3], c[3:4])[0])
+            n_rots = int(rotamer_set.n_rots_for_block[pose_i, block_i].item())
+            rot_off = int(rotamer_set.rot_offset_for_block[pose_i, block_i].item())
+            for r in range(n_rots):
+                co = int(rotamer_set.coord_offset_for_rot[rot_off + r].item())
+                rc4 = rotamer_set.coords[[co + int(a4[k]) for k in range(4)]].double()
+                rot_chi = float(_cd(rc4[0:1], rc4[1:2], rc4[2:3], rc4[3:4])[0])
+                delta = math.degrees(rot_chi - input_chi)
+                delta = (delta + 180.0) % 360.0 - 180.0
+                # assert deltas are only 0 or 180
+                assert min(abs(delta), abs(abs(delta) - 180.0)) < 1.0, (
+                    f"res {block_i} ({orig.name3}) rot {r}: "
+                    f"unexpected NHQ chi delta {delta:.2f} deg"
+                )
+        else:
+            n_rots = int(rotamer_set.n_rots_for_block[pose_i, block_i].item())
+            assert cache.n_proton_samples == 0 or n_rots == cache.n_proton_samples + 1
 
-    packer_energy_tables = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
+    (
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+        packer_energy_tables,
+    ) = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
+    # bg_bg_energies, packer_energy_tables = build_packer_energy_tables(
+    #     pose_stack, rotamer_set, sfxn
+    # )
+    # _, _ = run_pack_and_assert_scores(
+    #     pose_stack, rotamer_set, packer_energy_tables, sfxn, bg_bg_energies
+    # )
     _, _ = run_pack_and_assert_scores(
-        pose_stack, rotamer_set, packer_energy_tables, sfxn
+        pose_stack,
+        rotamer_set,
+        packer_energy_tables,
+        sfxn,
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
     )
 
 
@@ -193,6 +320,8 @@ def test_pack_rotamers_w_cst(default_database, ubq_pdb, dun_sampler, torch_devic
     pose_stack, task = setup_pose_stack_and_task(
         [p] * n_poses, torch_device, dun_sampler
     )
+    task = SetPackerTask.from_packer_task(task)
+
     sfxn = get_constraints_only_sfxn(default_database, torch_device)
     pose_stack, rotamer_set = build_rotamers(
         pose_stack, task, pose_stack.packed_block_types.chem_db
@@ -249,8 +378,31 @@ def test_pack_rotamers_w_cst(default_database, ubq_pdb, dun_sampler, torch_devic
     )
 
     pose_stack = attrs.evolve(pose_stack, constraint_set=constraints)
-    packer_energy_tables = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
-    run_pack_and_assert_scores(pose_stack, rotamer_set, packer_energy_tables, sfxn)
+    (
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+        packer_energy_tables,
+    ) = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
+    # bg_bg_energies, packer_energy_tables = build_packer_energy_tables(
+    #     pose_stack, rotamer_set, sfxn
+    # )
+    # run_pack_and_assert_scores(
+    #     pose_stack, rotamer_set, packer_energy_tables, sfxn, bg_bg_energies
+    # )
+    _, _ = run_pack_and_assert_scores(
+        pose_stack,
+        rotamer_set,
+        packer_energy_tables,
+        sfxn,
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+    )
     if torch_device == torch.device("cuda"):
         torch.cuda.synchronize()
 
@@ -263,12 +415,36 @@ def test_pack_rotamers_w_empty_interaction_graph(
     pose_stack, task = setup_pose_stack_and_task(
         [p] * n_poses, torch_device, dun_sampler
     )
+    task = SetPackerTask.from_packer_task(task)
     sfxn = get_constraints_only_sfxn(default_database, torch_device)
     pose_stack, rotamer_set = build_rotamers(
         pose_stack, task, pose_stack.packed_block_types.chem_db
     )
-    packer_energy_tables = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
-    run_pack_and_assert_scores(pose_stack, rotamer_set, packer_energy_tables, sfxn)
+    (
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+        packer_energy_tables,
+    ) = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
+    # bg_bg_energies, packer_energy_tables = build_packer_energy_tables(
+    #     pose_stack, rotamer_set, sfxn
+    # )
+    _, _ = run_pack_and_assert_scores(
+        pose_stack,
+        rotamer_set,
+        packer_energy_tables,
+        sfxn,
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+    )
+    # run_pack_and_assert_scores(
+    #     pose_stack, rotamer_set, packer_energy_tables, sfxn, bg_bg_energies
+    # )
 
 
 def test_pack_rotamers_w_dslf(
@@ -279,12 +455,36 @@ def test_pack_rotamers_w_dslf(
     pose_stack, task = setup_pose_stack_and_task(
         [p] * n_poses, torch_device, dun_sampler
     )
+    task = SetPackerTask.from_packer_task(task)
     sfxn = get_packer_sfxn(default_database, torch_device)
     pose_stack, rotamer_set = build_rotamers(
         pose_stack, task, pose_stack.packed_block_types.chem_db
     )
-    packer_energy_tables = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
-    run_pack_and_assert_scores(pose_stack, rotamer_set, packer_energy_tables, sfxn)
+    (
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+        packer_energy_tables,
+    ) = build_packer_energy_tables(pose_stack, rotamer_set, sfxn)
+    # bg_bg_energies, packer_energy_tables = build_packer_energy_tables(
+    #     pose_stack, rotamer_set, sfxn
+    # )
+    # run_pack_and_assert_scores(
+    #     pose_stack, rotamer_set, packer_energy_tables, sfxn, bg_bg_energies
+    # )
+    _, _ = run_pack_and_assert_scores(
+        pose_stack,
+        rotamer_set,
+        packer_energy_tables,
+        sfxn,
+        rotamer_for_nonmolten_block,
+        n_molten_blocks_per_pose,
+        bc_rot_offset_for_molten_block,
+        bc_rot_to_orig_rot,
+        bg_bg_energies,
+    )
 
 
 def test_pack_rotamers2(default_database, ubq_pdb, dun_sampler, torch_device):

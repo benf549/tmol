@@ -5,9 +5,8 @@
 #include <tmol/utility/tensor/context_manager.hh>
 #include <tmol/utility/function_dispatch/aten.hh>
 
-#include <tmol/score/common/simple_dispatch.hh>
-#include <tmol/score/common/forall_dispatch.hh>
 #include <tmol/score/common/device_operations.hh>
+#include <tmol/score/common/whole_pose_scoring.hh>
 
 #include "elec_pose_score.hh"
 
@@ -55,6 +54,7 @@ class ElecPoseScoreOp
       Tensor block_type_inter_repr_path_distance,
 
       Tensor block_type_intra_repr_path_distance,
+      Tensor block_type_is_ligand_fragment,
       Tensor global_params,
       double max_dis,  // host scalar; needed by detect-neighbors call
       bool output_block_pair_energies) {
@@ -97,6 +97,7 @@ class ElecPoseScoreOp
                   TCAST(block_type_inter_repr_path_distance),
 
                   TCAST(block_type_intra_repr_path_distance),
+                  TCAST(block_type_is_ligand_fragment),
                   TCAST(global_params),
                   (Real)max_dis,
                   output_block_pair_energies,
@@ -136,6 +137,7 @@ class ElecPoseScoreOp
            block_type_inter_repr_path_distance,
 
            block_type_intra_repr_path_distance,
+           block_type_is_ligand_fragment,
            global_params,
            block_neighbors});
     } else {
@@ -155,16 +157,9 @@ class ElecPoseScoreOp
     //   block-pair scoring mode or single-score mode
     if (saved.size() == 2) {
       // single-score mode
-      auto saved_grads = ctx->get_saved_variables();
-      auto saved_grad = saved_grads[0];
-      auto pose_ind_for_atom = saved_grads[1];
-
-      auto atom_ingrads = grad_outputs[0].index_select(1, pose_ind_for_atom);
-
-      while (atom_ingrads.dim() < saved_grad.dim()) {
-        atom_ingrads = atom_ingrads.unsqueeze(-1);
-      }
-      dV_d_pose_coords = saved_grad * atom_ingrads;
+      auto saved_grad = saved[0];
+      dV_d_pose_coords =
+          common::accumulate_whole_pose_gradients(saved_grad, grad_outputs[0]);
 
     } else {
       // block-pair mode
@@ -200,6 +195,7 @@ class ElecPoseScoreOp
       auto block_type_inter_repr_path_distance = saved[i++];
 
       auto block_type_intra_repr_path_distance = saved[i++];
+      auto block_type_is_ligand_fragment = saved[i++];
       auto global_params = saved[i++];
       auto block_neighbors = saved[i++];
 
@@ -244,6 +240,7 @@ class ElecPoseScoreOp
                     TCAST(block_type_inter_repr_path_distance),
 
                     TCAST(block_type_intra_repr_path_distance),
+                    TCAST(block_type_is_ligand_fragment),
                     TCAST(global_params),
                     TCAST(block_neighbors),
                     TCAST(dTdV));
@@ -256,7 +253,7 @@ class ElecPoseScoreOp
         dV_d_pose_coords, torch::Tensor(), torch::Tensor(), torch::Tensor(),
         torch::Tensor(),  torch::Tensor(), torch::Tensor(), torch::Tensor(),
         torch::Tensor(),  torch::Tensor(), torch::Tensor(), torch::Tensor(),
-        torch::Tensor(),
+        torch::Tensor(),  torch::Tensor(),
 
         torch::Tensor(),  torch::Tensor(),
 
@@ -300,6 +297,7 @@ class ElecRotamerScoreOp
       Tensor block_type_inter_repr_path_distance,
 
       Tensor block_type_intra_repr_path_distance,
+      Tensor block_type_is_ligand_fragment,
       Tensor global_params,
       double max_dis,  // host scalar; needed by detect-neighbors call
       bool output_block_pair_energies) {
@@ -343,6 +341,7 @@ class ElecRotamerScoreOp
                   TCAST(block_type_inter_repr_path_distance),
 
                   TCAST(block_type_intra_repr_path_distance),
+                  TCAST(block_type_is_ligand_fragment),
                   TCAST(global_params),
                   (Real)max_dis,
                   output_block_pair_energies,
@@ -382,6 +381,7 @@ class ElecRotamerScoreOp
            block_type_inter_repr_path_distance,
 
            block_type_intra_repr_path_distance,
+           block_type_is_ligand_fragment,
            global_params,
            dispatch_inds});
     } else {
@@ -445,6 +445,7 @@ class ElecRotamerScoreOp
       auto block_type_inter_repr_path_distance = saved[i++];
 
       auto block_type_intra_repr_path_distance = saved[i++];
+      auto block_type_is_ligand_fragment = saved[i++];
       auto global_params = saved[i++];
       auto dispatch_inds = saved[i++];
 
@@ -489,6 +490,7 @@ class ElecRotamerScoreOp
                     TCAST(block_type_inter_repr_path_distance),
 
                     TCAST(block_type_intra_repr_path_distance),
+                    TCAST(block_type_is_ligand_fragment),
                     TCAST(global_params),
                     TCAST(dispatch_inds),
                     TCAST(dTdV));
@@ -509,6 +511,7 @@ class ElecRotamerScoreOp
         torch::Tensor(),
 
         torch::Tensor(),  torch::Tensor(), torch::Tensor(), torch::Tensor(),
+        torch::Tensor(),
     };
   }
 };
@@ -540,6 +543,7 @@ std::vector<Tensor> elec_pose_scores_op(
     Tensor block_type_inter_repr_path_distance,
 
     Tensor block_type_intra_repr_path_distance,
+    Tensor block_type_is_ligand_fragment,
     Tensor global_params,
     double max_dis,
     bool output_block_pair_energies) {
@@ -568,6 +572,7 @@ std::vector<Tensor> elec_pose_scores_op(
       block_type_inter_repr_path_distance,
 
       block_type_intra_repr_path_distance,
+      block_type_is_ligand_fragment,
       global_params,
       max_dis,
       output_block_pair_energies);
@@ -600,6 +605,7 @@ std::vector<Tensor> elec_rotamer_scores_op(
     Tensor block_type_inter_repr_path_distance,
 
     Tensor block_type_intra_repr_path_distance,
+    Tensor block_type_is_ligand_fragment,
     Tensor global_params,
     double max_dis,
     bool output_block_pair_energies) {
@@ -628,6 +634,7 @@ std::vector<Tensor> elec_rotamer_scores_op(
       block_type_inter_repr_path_distance,
 
       block_type_intra_repr_path_distance,
+      block_type_is_ligand_fragment,
       global_params,
       max_dis,
       output_block_pair_energies);

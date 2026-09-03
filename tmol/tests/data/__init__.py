@@ -1,11 +1,24 @@
+from ._util import LazyContentsMapping, LazyFileMapping  # noqa: F401
+
 import pytest
 import os
 import torch
 import biotite.structure.io
+from pathlib import Path
 
-from . import pdb
+from . import pdb  # noqa: E402
 
 _CIF_DATA_DIR = os.path.join(os.path.dirname(__file__), "cif")
+
+
+def data_path(*parts: str) -> Path:
+    """Absolute path to a file/dir under ``tmol/tests/data``.
+
+    Anchored to this package's own location, so it is robust to test modules
+    moving between directories (unlike ``Path(__file__).parent.parent / ...``
+    in a test file, which breaks if the file's depth changes).
+    """
+    return Path(__file__).parent.joinpath(*parts)
 
 
 def load_cif(pdb_code):
@@ -32,8 +45,18 @@ def ubq_pdb():
 
 
 @pytest.fixture(scope="session")
+def kin_minimized_ubq_pdb():
+    return pdb.data["kin_minimized_1ubq"]
+
+
+@pytest.fixture(scope="session")
 def pdb_1r21():
     return pdb.data["1R21"]
+
+
+@pytest.fixture(scope="session")
+def pdb_10VB():
+    return pdb.data["10VB"]
 
 
 @pytest.fixture(scope="session")
@@ -41,9 +64,54 @@ def disulfide_pdb():
     return pdb.data["3plc"]
 
 
+@pytest.fixture(scope="session")
+def pdb_6DMZ():
+    return pdb.data["6DMZ_A"]
+
+
 @pytest.fixture()
 def water_box_pdb():
     return pdb.data["water_box"]
+
+
+@pytest.fixture()
+def dna_pdb():
+    # 1BNA, the Dickerson dodecamer: two DNA chains, no protein.
+    # Waters stripped and hydrogens added by Rosetta.
+    return pdb.data["1BNA"]
+
+
+@pytest.fixture()
+def rna_pdb():
+    # 3ZP8, the full-length hammerhead ribozyme: chain A residues 2-43, a
+    # single 42-nt RNA strand. The 5' GDP cap, the sodium ions, waters, and
+    # chain B (which carries a 2'-O-methyl C and a deoxy C) are stripped.
+    # Hydrogens added by Rosetta.
+    return pdb.data["3ZP8"]
+
+
+@pytest.fixture()
+def protein_dna_pdb():
+    # 1YSA, the GCN4 bZIP dimer bound to DNA: two DNA chains and two protein
+    # chains. Waters stripped and hydrogens added by Rosetta.
+    return pdb.data["1YSA"]
+
+
+def _load_pdb_structure(name):
+    fname = os.path.join(__file__.rpartition("/")[0], "pdb", name)
+    return biotite.structure.io.load_structure(
+        fname, extra_fields=["occupancy", "b_factor"]
+    )
+
+
+@pytest.fixture()
+def biotite_dna():
+    return _load_pdb_structure("1bna.pdb")
+
+
+@pytest.fixture()
+def biotite_protein_dna():
+    return _load_pdb_structure("1ysa.pdb")
 
 
 @pytest.fixture(scope="session")
@@ -176,7 +244,7 @@ def biotite_1ubq_err():
 
 @pytest.fixture()
 def biotite_1ubq_cif():
-    fname = os.path.join(__file__.rpartition("/")[0], "pdb", "1UBQ.cif")
+    fname = os.path.join(__file__.rpartition("/")[0], "cif", "1UBQ.cif")
     if not os.path.exists(fname):
         pytest.skip(f"Test data file not found: {fname}")
     return biotite.structure.io.load_structure(
@@ -197,6 +265,68 @@ def biotite_1bl8():
     fname = os.path.join(__file__.rpartition("/")[0], "pdb", "1BL8.pdb")
     return biotite.structure.io.load_structure(
         fname, extra_fields=["occupancy", "b_factor"]
+    )
+
+
+@pytest.fixture()
+def cif_184l_with_i4b():
+    """Lysozyme 184L with I4B ligand."""
+    import biotite.structure.io.pdbx
+
+    fname = os.path.join(__file__.rpartition("/")[0], "cif", "184l__1__1.A__1.E.cif")
+    pdbx_file = biotite.structure.io.pdbx.CIFFile.read(fname)
+    return biotite.structure.io.pdbx.get_structure(
+        pdbx_file, model=1, include_bonds=True
+    )
+
+
+@pytest.fixture()
+def cif_155c_with_hem():
+    """Cytochrome c 155C with HEM ligand."""
+    import biotite.structure.io.pdbx
+
+    fname = os.path.join(__file__.rpartition("/")[0], "cif", "155c__1__1.A__1.B.cif")
+    pdbx_file = biotite.structure.io.pdbx.CIFFile.read(fname)
+    return biotite.structure.io.pdbx.get_structure(
+        pdbx_file, model=1, include_bonds=True
+    )
+
+
+@pytest.fixture()
+def cif_1a25_with_pse():
+    """1A25 with PSE ligand (partial occupancy)."""
+    import biotite.structure.io.pdbx
+
+    fname = os.path.join(__file__.rpartition("/")[0], "cif", "1a25__1__1.B__1.I.cif")
+    pdbx_file = biotite.structure.io.pdbx.CIFFile.read(fname)
+    return biotite.structure.io.pdbx.get_structure(
+        pdbx_file, model=1, include_bonds=True
+    )
+
+
+@pytest.fixture()
+def cif_1a0i_with_atp():
+    """1A0I with ATP ligand (>32-atom tile edge case)."""
+    import biotite.structure.io.pdbx
+
+    fname = os.path.join(__file__.rpartition("/")[0], "cif", "1A0I.cif")
+    pdbx_file = biotite.structure.io.pdbx.CIFFile.read(fname)
+    return biotite.structure.io.pdbx.get_structure(
+        pdbx_file, model=1, include_bonds=True
+    )
+
+
+@pytest.fixture()
+def pdb_1a0i_with_atp():
+    """1A0I (PDB format) with ATP ligand."""
+    import biotite.structure.io.pdb
+
+    fname = os.path.join(__file__.rpartition("/")[0], "pdb", "1A0I.pdb")
+    pdb_file = biotite.structure.io.pdb.PDBFile.read(fname)
+    return pdb_file.get_structure(
+        model=1,
+        include_bonds=True,
+        extra_fields=["occupancy", "b_factor"],
     )
 
 

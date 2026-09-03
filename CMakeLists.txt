@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.24...3.31)
 
 option(TMOL_ENABLE_CUDA "Build CUDA extensions (disable for CPU-only)" ON)
 
@@ -7,17 +7,74 @@ option(TMOL_ENABLE_CUDA "Build CUDA extensions (disable for CPU-only)" ON)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 include(CheckLanguage)
+if(TMOL_ENABLE_CUDA AND NOT CMAKE_CUDA_COMPILER)
+  # check_language() does not reliably discover toolkit installs under
+  # /usr/local/cuda when CMake is launched outside an activated CUDA env.
+  find_program(
+    _TMOL_NVCC_EXECUTABLE
+    NAMES nvcc
+    HINTS "$ENV{CUDA_HOME}" "$ENV{CUDA_PATH}" /usr/local/cuda
+    PATH_SUFFIXES bin
+  )
+  if(_TMOL_NVCC_EXECUTABLE)
+    set(CMAKE_CUDA_COMPILER "${_TMOL_NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler")
+  endif()
+endif()
 check_language(CUDA)
 
 if(CMAKE_CUDA_COMPILER AND TMOL_ENABLE_CUDA)
   # ── CUDA architecture selection — MUST be set before project() so that
   # enable_language(CUDA) uses our architectures, not the nvcc defaults.
   # CMAKE_CUDA_ARCHITECTURES can be set via:
-  #   -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90"  (from scikit-build-core -C flags)
+  #   -DCMAKE_CUDA_ARCHITECTURES="80;90;103"  (from scikit-build-core -C flags)
   #   TORCH_CUDA_ARCH_LIST env var (PyTorch format: "7.0 8.0 9.0+PTX")
   #   or falls back to a sensible default.
+  #
+  # Ask nvcc instead of maintaining a version-to-architecture table. CUDA 13.1,
+  # for example, can emit sm_103 and sm_121 even though a numeric "max arch"
+  # test would neither validate the former nor discover the latter. Keep the
+  # project floor at Turing (sm_75), matching tmol's supported Colab wheels.
+  execute_process(
+    COMMAND ${CMAKE_CUDA_COMPILER} --list-gpu-code
+    OUTPUT_VARIABLE _TMOL_NVCC_GPU_CODE
+    ERROR_VARIABLE _TMOL_NVCC_GPU_CODE_ERROR
+    RESULT_VARIABLE _TMOL_NVCC_GPU_CODE_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  string(REGEX MATCHALL "sm_[0-9]+" _TMOL_NVCC_SM_NAMES "${_TMOL_NVCC_GPU_CODE}")
+  set(_TMOL_NVCC_SUPPORTED_ARCHS "")
+  foreach(_SM_NAME ${_TMOL_NVCC_SM_NAMES})
+    string(REPLACE "sm_" "" _SM_ARCH "${_SM_NAME}")
+    if(_SM_ARCH GREATER_EQUAL 75)
+      list(APPEND _TMOL_NVCC_SUPPORTED_ARCHS "${_SM_ARCH}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _TMOL_NVCC_SUPPORTED_ARCHS)
+  list(SORT _TMOL_NVCC_SUPPORTED_ARCHS COMPARE NATURAL ORDER ASCENDING)
+  if(NOT _TMOL_NVCC_SUPPORTED_ARCHS)
+    message(FATAL_ERROR
+      "tmol: nvcc --list-gpu-code did not report any supported sm_75+ targets "
+      "(exit ${_TMOL_NVCC_GPU_CODE_RESULT}): ${_TMOL_NVCC_GPU_CODE_ERROR}")
+  endif()
+  # Ship SASS for every release target and a single forward-compatible PTX
+  # image at the newest target. Unsuffixed numeric CMake architectures would
+  # otherwise embed redundant PTX for every generation.
+  set(_TMOL_NVCC_RELEASE_ARCHS "")
+  list(LENGTH _TMOL_NVCC_SUPPORTED_ARCHS _TMOL_NVCC_ARCH_COUNT)
+  math(EXPR _TMOL_NVCC_LAST_ARCH_INDEX "${_TMOL_NVCC_ARCH_COUNT} - 1")
+  foreach(_ARCH_INDEX RANGE ${_TMOL_NVCC_LAST_ARCH_INDEX})
+    list(GET _TMOL_NVCC_SUPPORTED_ARCHS ${_ARCH_INDEX} _SM_ARCH)
+    if(_ARCH_INDEX EQUAL _TMOL_NVCC_LAST_ARCH_INDEX)
+      list(APPEND _TMOL_NVCC_RELEASE_ARCHS "${_SM_ARCH}")
+    else()
+      list(APPEND _TMOL_NVCC_RELEASE_ARCHS "${_SM_ARCH}-real")
+    endif()
+  endforeach()
+
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
+    if(DEFINED ENV{CMAKE_CUDA_ARCHITECTURES})
+      set(CMAKE_CUDA_ARCHITECTURES "$ENV{CMAKE_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures")
+    elseif(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
       set(_ARCH_STR "$ENV{TORCH_CUDA_ARCH_LIST}")
       string(REPLACE " " ";" _ARCH_LIST "${_ARCH_STR}")
       set(_CLEAN_ARCHS "")
@@ -33,11 +90,59 @@ if(CMAKE_CUDA_COMPILER AND TMOL_ENABLE_CUDA)
       endforeach()
       set(CMAKE_CUDA_ARCHITECTURES ${_CLEAN_ARCHS} CACHE STRING "CUDA architectures")
     else()
-      set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING "CUDA architectures")
+      set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures")
     endif()
   endif()
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "all-major" OR
+      CMAKE_CUDA_ARCHITECTURES STREQUAL "all")
+    # CMake's symbolic all values are compiler-policy dependent. Resolve them
+    # to nvcc's exact sm_75+ list so release wheels cannot silently omit an
+    # architecture discovered above.
+    set(CMAKE_CUDA_ARCHITECTURES "${_TMOL_NVCC_RELEASE_ARCHS}" CACHE STRING "CUDA architectures" FORCE)
+  endif()
+
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+    # CMake 3.24+ queries the GPU(s) visible at configure time and emits only
+    # their native device code. This is the fast default for local builds.
+    set(_TMOL_CUDA_ARCHITECTURES "native")
+  else()
+    # Filter requested numeric arches by exact compiler support. Architectures
+    # are not a simple compatibility interval, so a maximum clamp is wrong.
+    set(_TMOL_FILTERED_ARCHS "")
+    set(_TMOL_REJECTED_ARCHS "")
+    foreach(_A ${CMAKE_CUDA_ARCHITECTURES})
+      string(REPLACE "-real" "" _A_NUM "${_A}")
+      string(REPLACE "-virtual" "" _A_NUM "${_A_NUM}")
+      if(_A_NUM IN_LIST _TMOL_NVCC_SUPPORTED_ARCHS)
+        list(APPEND _TMOL_FILTERED_ARCHS "${_A}")
+      else()
+        list(APPEND _TMOL_REJECTED_ARCHS "${_A}")
+      endif()
+    endforeach()
+    if(NOT _TMOL_FILTERED_ARCHS)
+      message(FATAL_ERROR
+        "tmol: none of the requested CUDA architectures "
+        "(${CMAKE_CUDA_ARCHITECTURES}) are supported by ${CMAKE_CUDA_COMPILER}; "
+        "supported sm_75+ targets: ${_TMOL_NVCC_SUPPORTED_ARCHS}")
+    endif()
+    if(_TMOL_REJECTED_ARCHS)
+      message(WARNING
+        "tmol: ignoring CUDA architectures not supported by this nvcc: "
+        "${_TMOL_REJECTED_ARCHS}")
+    endif()
+    set(_TMOL_CUDA_ARCHITECTURES "${_TMOL_FILTERED_ARCHS}")
+  endif()
+  # Preserve the selected value independently: project() may overwrite the
+  # cache while enabling CUDA. `all` is numeric here; `native` intentionally
+  # remains symbolic so nvcc resolves the GPU visible at compile time.
+  set(CMAKE_CUDA_ARCHITECTURES "${_TMOL_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures" FORCE)
+  set(CMAKE_CUDA_ARCHITECTURES "${_TMOL_CUDA_ARCHITECTURES}")
+  message(STATUS "tmol: nvcc supports sm_75+ targets ${_TMOL_NVCC_SUPPORTED_ARCHS}")
+  message(STATUS "tmol: using CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
 
   project(tmol LANGUAGES CXX CUDA)
+  set(CMAKE_CUDA_ARCHITECTURES "${_TMOL_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures" FORCE)
+  set(CMAKE_CUDA_ARCHITECTURES "${_TMOL_CUDA_ARCHITECTURES}")
   set(TMOL_HAS_CUDA TRUE)
   message(STATUS "tmol: CUDA enabled, CMAKE_CUDA_ARCHITECTURES = ${CMAKE_CUDA_ARCHITECTURES}")
 else()
@@ -63,11 +168,32 @@ if(NOT _TMOL_PYTHON_INCLUDE_DIRS)
 endif()
 message(STATUS "tmol: Python include dirs = ${_TMOL_PYTHON_INCLUDE_DIRS}")
 
-if(TMOL_HAS_CUDA)
-  # Save CMAKE_CUDA_ARCHITECTURES before find_package(Torch) — Caffe2 sets it to OFF.
-  get_property(_TMOL_CUDA_ARCHITECTURES CACHE CMAKE_CUDA_ARCHITECTURES PROPERTY VALUE)
-  message(STATUS "tmol: _TMOL_CUDA_ARCHITECTURES (from cache) = ${_TMOL_CUDA_ARCHITECTURES}")
+# PyTorch 2.13 and newer require C++20 for third-party extensions. Keep the
+# older release lanes on C++17 so their established CUDA toolchains remain
+# unchanged.
+execute_process(
+  COMMAND ${Python_EXECUTABLE} -c "import torch; v=torch.__version__.split('.'); print(f'{v[0]};{v[1]}')"
+  OUTPUT_VARIABLE _TORCH_VERSION
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+list(GET _TORCH_VERSION 0 TORCH_VERSION_MAJOR)
+list(GET _TORCH_VERSION 1 TORCH_VERSION_MINOR)
 
+if(TORCH_VERSION_MAJOR GREATER 2
+    OR (TORCH_VERSION_MAJOR EQUAL 2 AND TORCH_VERSION_MINOR GREATER_EQUAL 13))
+  set(_TMOL_CXX_STANDARD 20)
+else()
+  set(_TMOL_CXX_STANDARD 17)
+endif()
+set(CMAKE_CXX_STANDARD ${_TMOL_CXX_STANDARD})
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(TMOL_HAS_CUDA)
+  set(CMAKE_CUDA_STANDARD ${_TMOL_CXX_STANDARD})
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+message(STATUS "tmol: PyTorch ${TORCH_VERSION_MAJOR}.${TORCH_VERSION_MINOR}, using C++${_TMOL_CXX_STANDARD}")
+
+if(TMOL_HAS_CUDA)
   # Set TORCH_CUDA_ARCH_LIST env var BEFORE find_package(Torch) so that
   # Caffe2's cuda.cmake uses our architectures instead of defaulting to
   # all archs nvcc supports (which includes sm_52 that lacks double atomicAdd).
@@ -92,11 +218,20 @@ endif()
 
 find_package(Torch REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
+# Linux Torch wheels require OpenMP compiler flags for at::parallel_for;
+# platforms using Torch's native thread pool do not.
+find_package(OpenMP COMPONENTS CXX QUIET)
 
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH)
 message(STATUS "tmol: TORCH_PYTHON_LIBRARY = ${TORCH_PYTHON_LIBRARY}")
 
 if(TMOL_HAS_CUDA)
+  # Caffe2's TorchConfig.cmake can set CMAKE_CUDA_ARCHITECTURES=OFF or inherit
+  # PyTorch's full -gencode list (including arches this nvcc cannot compile).
+  set(CMAKE_CUDA_ARCHITECTURES "${_TMOL_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures" FORCE)
+  set(CMAKE_CUDA_ARCHITECTURES "${_TMOL_CUDA_ARCHITECTURES}")
+  message(STATUS "tmol: Restored CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
+
   # Caffe2's TorchConfig.cmake unconditionally appends the -gencode flags that
   # PyTorch was originally built with. Replace them with our architectures.
   string(REGEX REPLACE "-gencode[;= ]arch=compute_[0-9]+,code=sm_[0-9]+" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
@@ -104,18 +239,9 @@ if(TMOL_HAS_CUDA)
   string(REGEX REPLACE " +" " " CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
   string(STRIP "${CMAKE_CUDA_FLAGS}" CMAKE_CUDA_FLAGS)
 
-  set(_TMOL_GENCODE_FLAGS "")
-  foreach(_A ${_TMOL_CUDA_ARCHITECTURES})
-    string(REPLACE "-real" "" _A_CLEAN "${_A}")
-    if("${_A}" STREQUAL "${_A_CLEAN}")
-      set(_TMOL_GENCODE_FLAGS "${_TMOL_GENCODE_FLAGS} -gencode arch=compute_${_A_CLEAN},code=sm_${_A_CLEAN} -gencode arch=compute_${_A_CLEAN},code=compute_${_A_CLEAN}")
-    else()
-      set(_TMOL_GENCODE_FLAGS "${_TMOL_GENCODE_FLAGS} -gencode arch=compute_${_A_CLEAN},code=sm_${_A_CLEAN}")
-    endif()
-  endforeach()
-  string(STRIP "${_TMOL_GENCODE_FLAGS}" _TMOL_GENCODE_FLAGS)
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${_TMOL_GENCODE_FLAGS}")
-  message(STATUS "tmol: CMAKE_CUDA_FLAGS after fixing gencode = ${CMAKE_CUDA_FLAGS}")
+  # CMake emits the requested architecture flags for each CUDA target. Do not
+  # append another copy here: doing so compiles every device image twice.
+  message(STATUS "tmol: CMAKE_CUDA_FLAGS after removing Torch gencode = ${CMAKE_CUDA_FLAGS}")
 endif()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -124,22 +250,7 @@ endif()
 
 # TORCH_CXX_FLAGS contains -D_GLIBCXX_USE_CXX11_ABI=0 or =1
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if(TMOL_HAS_CUDA)
-  set(CMAKE_CUDA_STANDARD 17)
-  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-endif()
-
-# Get torch version for compile-time macros
-execute_process(
-  COMMAND ${Python_EXECUTABLE} -c "import torch; v=torch.__version__.split('.'); print(f'{v[0]};{v[1]}')"
-  OUTPUT_VARIABLE _TORCH_VERSION
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-list(GET _TORCH_VERSION 0 TORCH_VERSION_MAJOR)
-list(GET _TORCH_VERSION 1 TORCH_VERSION_MINOR)
+message(STATUS "tmol: TORCH_CXX_FLAGS = ${TORCH_CXX_FLAGS}")
 
 if(TMOL_HAS_CUDA)
   set(TMOL_NVCC_THREADS "4" CACHE STRING "Threads per nvcc invocation")
@@ -180,6 +291,16 @@ endif()
 # Helper functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Torch's CMake targets advertise optional CUDA libraries such as NVRTC even
+# when an extension does not use them.  Keep those libraries out of DT_NEEDED
+# so wheels remain loadable with PyTorch distributions that do not ship every
+# optional CUDA component (notably the monolithic aarch64 wheels).
+function(tmol_set_portable_link_flags TARGET)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(${TARGET} PRIVATE "-Wl,--as-needed")
+  endif()
+endfunction()
+
 # Common compile options for CUDA extensions
 function(tmol_set_cuda_flags TARGET)
   target_compile_options(${TARGET} PRIVATE
@@ -195,6 +316,7 @@ function(tmol_set_cuda_flags TARGET)
     >
   )
   target_include_directories(${TARGET} PRIVATE ${TMOL_INCLUDE_DIRS})
+  tmol_set_portable_link_flags(${TARGET})
   target_link_libraries(${TARGET} PRIVATE ${TORCH_LIBRARIES})
 endfunction()
 
@@ -204,6 +326,7 @@ function(tmol_set_cpp_flags TARGET)
     $<$<COMPILE_LANGUAGE:CXX>:-O3 -w -DWITH_NVTX>
   )
   target_include_directories(${TARGET} PRIVATE ${TMOL_INCLUDE_DIRS})
+  tmol_set_portable_link_flags(${TARGET})
   target_link_libraries(${TARGET} PRIVATE ${TORCH_LIBRARIES})
 endfunction()
 
@@ -245,9 +368,6 @@ set(_C_SOURCES
   # kinematics/compiled
   tmol/kinematics/compiled/compiled_ops.cpp
   tmol/kinematics/compiled/compiled.cpu.cpp
-  # optimization/compiled
-  tmol/optimization/compiled/lbfgs.ops.cpp
-  tmol/optimization/compiled/lbfgs.cpu.cpp
   # pack/compiled
   tmol/pack/compiled/compiled.ops.cpp
   tmol/pack/compiled/compiled.cpu.cpp
@@ -263,6 +383,9 @@ set(_C_SOURCES
   # score/cartbonded
   tmol/score/cartbonded/potentials/compiled.ops.cpp
   tmol/score/cartbonded/potentials/cartbonded_pose_score.cpu.cpp
+  # score/genbonded
+  tmol/score/genbonded/potentials/compiled.ops.cpp
+  tmol/score/genbonded/potentials/genbonded_pose_score.cpu.cpp
   # score/constraint
   tmol/score/constraint/potentials/compiled.ops.cpp
   tmol/score/constraint/potentials/constraint_score.cpu.cpp
@@ -293,12 +416,12 @@ if(TMOL_HAS_CUDA)
     tmol/io/details/compiled/gen_pose_leaf_atoms.cuda.cu
     tmol/io/details/compiled/resolve_his_taut.cuda.cu
     tmol/kinematics/compiled/compiled.cuda.cu
-    tmol/optimization/compiled/lbfgs.cuda.cu
     tmol/pack/compiled/compiled.cuda.cu
     tmol/pack/rotamer/dunbrack/compiled.cuda.cu
     tmol/pose/compiled/apsp.cuda.cu
     tmol/score/backbone_torsion/potentials/backbone_torsion_pose_score.cuda.cu
     tmol/score/cartbonded/potentials/cartbonded_pose_score.cuda.cu
+    tmol/score/genbonded/potentials/genbonded_pose_score.cuda.cu
     tmol/score/constraint/potentials/constraint_score.cuda.cu
     tmol/score/disulfide/potentials/disulfide_pose_score.cuda.cu
     tmol/score/dunbrack/potentials/dunbrack_pose_score.cuda.cu
@@ -331,6 +454,9 @@ if(TMOL_HAS_CUDA)
   tmol_set_cuda_flags(_C)
 else()
   tmol_set_cpp_flags(_C)
+endif()
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(_C PRIVATE OpenMP::OpenMP_CXX)
 endif()
 install(TARGETS _C DESTINATION tmol)
 
@@ -412,7 +538,7 @@ if(TMOL_BUILD_TESTS)
     tmol/tests/utility/datastructures/in_place_heap.cpp
   )
 
-  # --- pybind CUDA test extensions (skipped in CPU-only builds) ---
+  # --- mixed-backend and CUDA-only test extensions ---
 
   if(TMOL_HAS_CUDA)
     tmol_add_pybind_cuda_ext(
@@ -428,10 +554,10 @@ if(TMOL_BUILD_TESTS)
     )
 
     tmol_add_pybind_cuda_ext(
-      test_dispatch "tmol/tests/score/common/dispatch" "_ext"
-      tmol/tests/score/common/dispatch/test.pybind.cpp
-      tmol/tests/score/common/dispatch/test_cpu.cpp
-      tmol/tests/score/common/dispatch/test_cuda.cu
+      test_device_operations "tmol/tests/score/common/device_operations" "_ext"
+      tmol/tests/score/common/device_operations/test.pybind.cpp
+      tmol/tests/score/common/device_operations/test_cpu.cpp
+      tmol/tests/score/common/device_operations/test_cuda.cu
     )
 
     tmol_add_pybind_cuda_ext(
@@ -456,6 +582,26 @@ if(TMOL_BUILD_TESTS)
       tmol/tests/pack/rotamer/dunbrack/compiled.pybind.cpp
       tmol/tests/pack/rotamer/dunbrack/test_cpu.cpp
       tmol/tests/pack/rotamer/dunbrack/test_cuda.cu
+    )
+  else()
+    # These extensions exercise both backends. Keep their CPU tests available
+    # when CI intentionally builds without a CUDA toolchain.
+    tmol_add_pybind_cpp_ext(
+      test_bonded_atom "tmol/tests/score/bonded_atom" "_ext"
+      tmol/tests/score/bonded_atom/test.pybind.cpp
+      tmol/tests/score/bonded_atom/test_cpu.cpp
+    )
+
+    tmol_add_pybind_cpp_ext(
+      test_device_operations "tmol/tests/score/common/device_operations" "_ext"
+      tmol/tests/score/common/device_operations/test.pybind.cpp
+      tmol/tests/score/common/device_operations/test_cpu.cpp
+    )
+
+    tmol_add_pybind_cpp_ext(
+      test_dunbrack_ext "tmol/tests/pack/rotamer/dunbrack" "_ext"
+      tmol/tests/pack/rotamer/dunbrack/compiled.pybind.cpp
+      tmol/tests/pack/rotamer/dunbrack/test_cpu.cpp
     )
   endif()
 

@@ -1,0 +1,96 @@
+import threading
+
+import pytest
+
+import torch
+import torch.cuda
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Requires cuda.",
+)
+
+
+def zero_padded_counts(counts):
+    from math import log10, floor
+
+    max_count = max(counts)
+    width = int(floor(log10(max_count))) + 1
+    return [str(x).zfill(width) for x in counts]
+
+
+@pytest.fixture(params=["cpu", pytest.param("cuda", marks=requires_cuda)])
+def torch_device(request):
+    """Paramterized test fixure covering cpu & cuda torch devices."""
+
+    if request.param == "cpu":
+        device = torch.device("cpu")
+    elif request.param == "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        raise NotImplementedError
+
+    # Perform a "warmup" computation on the device, ensuring that it is
+    # initialized and available.
+    torch.arange(100, device=device).sum()
+
+    return device
+
+
+def cuda_not_implemented(f):
+    """Parametrize 'torch_device' as an xfail via NotImplementedError."""
+    return pytest.mark.parametrize(
+        "torch_device",
+        [
+            (torch.device("cpu")),
+            pytest.param(
+                torch.device("cuda"),
+                marks=[
+                    requires_cuda,
+                    pytest.mark.xfail(strict=True, raises=NotImplementedError),
+                ],
+            ),
+        ],
+    )(f)
+
+
+@pytest.fixture
+def torch_backward_coverage(request):
+    """Torch hook to enable coverage in backward pass.
+
+    Returns a hook function used to enable coverage tracing during
+    pytorch backward passes. Torch runs all backward passes in a
+    non-main thread, not spawned by the standard 'threading'
+    interface, so coverage does not trace the thread.
+
+    Example:
+
+    result = custom_func(input)
+
+    # enable the hook
+    result.register_hook(torch_backward_coverage)
+
+    # call backward via sum so hook fires before custom_op backward
+    result.sum().backward()
+    """
+
+    cov = request.config.pluginmanager.get_plugin("_cov")
+    cov = getattr(cov, "cov", None) if cov else None
+
+    if cov:
+        print("cov collector???", hasattr(cov, "collector"))
+        cov._collector.added_tracers = {threading.get_ident()}
+
+        def add_tracer(_):
+            tid = threading.get_ident()
+            if tid not in cov._collector.added_tracers:
+                print(f"pytorch backward trace: {tid}")
+                cov._collector.added_tracers.add(tid)
+                cov._collector._start_tracer()
+
+    else:
+
+        def add_tracer(_):
+            pass
+
+    return add_tracer

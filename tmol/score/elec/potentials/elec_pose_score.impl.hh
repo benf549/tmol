@@ -47,7 +47,8 @@ template <int TILE, template <typename> typename InterEnergyData, typename Real>
 EIGEN_DEVICE_FUNC int interres_count_pair_separation(
     InterEnergyData<Real> const& inter_dat,
     int atom_tile_ind1,
-    int atom_tile_ind2) {
+    int atom_tile_ind2,
+    bool crossover_3full) {
   int separation = inter_dat.min_separation;
   if (separation <= inter_dat.max_important_bond_separation) {
     separation = common::count_pair::shared_mem_inter_block_separation<TILE>(
@@ -60,29 +61,34 @@ EIGEN_DEVICE_FUNC int interres_count_pair_separation(
         inter_dat.r2.path_dist,
         inter_dat.conn_seps);
   }
+  if (crossover_3full && (separation == 3 || separation == 4)) separation = 5;
   return separation;
 }
 
 // MACROS
 
-#define SCORE_INTER_ELEC_ATOM_PAIR                              \
-  TMOL_DEVICE_FUNC(                                             \
-      int start_atom1,                                          \
-      int start_atom2,                                          \
-      int atom_tile_ind1,                                       \
-      int atom_tile_ind2,                                       \
-      ElecScoringData<Real> const& inter_dat)                   \
-      ->std::array<Real, 1> {                                   \
-    int separation = interres_count_pair_separation<TILE_SIZE>( \
-        inter_dat, atom_tile_ind1, atom_tile_ind2);             \
-    Real elec = elec_atom_energy_and_derivs(                    \
-        atom_tile_ind1,                                         \
-        atom_tile_ind2,                                         \
-        start_atom1,                                            \
-        start_atom2,                                            \
-        inter_dat,                                              \
-        separation);                                            \
-    return {elec};                                              \
+#define SCORE_INTER_ELEC_ATOM_PAIR                                      \
+  TMOL_DEVICE_FUNC(                                                     \
+      int start_atom1,                                                  \
+      int start_atom2,                                                  \
+      int atom_tile_ind1,                                               \
+      int atom_tile_ind2,                                               \
+      ElecScoringData<Real> const& inter_dat)                           \
+      ->std::array<Real, 1> {                                           \
+    int separation = interres_count_pair_separation<TILE_SIZE>(         \
+        inter_dat,                                                      \
+        atom_tile_ind1,                                                 \
+        atom_tile_ind2,                                                 \
+        block_type_is_ligand_fragment[inter_dat.r1.block_type]          \
+            && block_type_is_ligand_fragment[inter_dat.r2.block_type]); \
+    Real elec = elec_atom_energy_and_derivs(                            \
+        atom_tile_ind1,                                                 \
+        atom_tile_ind2,                                                 \
+        start_atom1,                                                    \
+        start_atom2,                                                    \
+        inter_dat,                                                      \
+        separation);                                                    \
+    return {elec};                                                      \
   }
 
 #define SCORE_INTRA_ELEC_ATOM_PAIR                                   \
@@ -435,6 +441,7 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
     // Entry i, j stores path_dist[rep(i), rep(j)]
     // Dimsize: n_block_types x max_n_atoms x max_n_atoms
     TView<Int, 3, D> block_type_intra_repr_path_distance,
+    TView<Int, 1, D> block_type_is_ligand_fragment,
     //////////////////////
 
     // LJ parameters
@@ -496,7 +503,11 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
   assert(block_type_intra_repr_path_distance.size(1) == max_n_block_atoms);
   assert(block_type_intra_repr_path_distance.size(2) == max_n_block_atoms);
 
-  auto dV_dcoords_t = TPack<Vec<Real, 3>, 2, D>::zeros({1, n_atoms});
+  // Block-pair autograd recomputes coordinate derivatives in backward.
+  bool const accumulate_derivs = compute_derivs && !output_block_pair_energies;
+  auto dV_dcoords_t = accumulate_derivs
+                          ? TPack<Vec<Real, 3>, 2, D>::zeros({1, n_atoms})
+                          : TPack<Vec<Real, 3>, 2, D>::empty({1, 0});
   auto dV_dcoords = dV_dcoords_t.view;
 
   auto scratch_rot_spheres_t =
@@ -535,8 +546,9 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
   }
   auto output = output_t.view;
 
-  // Optimal launch box on v100 and a100 is nt=32, vt=1
-  LAUNCH_BOX_32;
+  // This atom-pair kernel benefits from a 64-register budget on modern GPUs,
+  // which leaves enough resident warps to hide its dependency latency.
+  LAUNCH_BOX_32_OCC(32);
   // Define nt and reduce_t
   CTA_REAL_REDUCE_T_TYPEDEF;
 
@@ -691,20 +703,14 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
              int start_atom2,
              ElecScoringData<Real> const& score_dat,
              int cp_separation) {
-          if (compute_derivs) {
-            auto val = elec_atom_energy_and_derivs_full(
-                atom_tile_ind1,
-                atom_tile_ind2,
-                start_atom1,
-                start_atom2,
-                score_dat,
-                cp_separation,
-                dV_dcoords);
-            return val;
-          } else {
-            return elec_atom_energy(
-                atom_tile_ind1, atom_tile_ind2, score_dat, cp_separation);
-          }
+          return elec_atom_energy_and_derivs_full(
+              atom_tile_ind1,
+              atom_tile_ind2,
+              start_atom1,
+              start_atom2,
+              score_dat,
+              cp_separation,
+              dV_dcoords);
         });
 
     auto score_inter_elec_atom_pair = ([=] SCORE_INTER_ELEC_ATOM_PAIR);
@@ -837,12 +843,12 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
   // mgpu::standard_context_t context(wrapped_stream.stream());
 
   // 3
-  if (output_block_pair_energies) {
-    DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-        mgr, n_poses * max_n_upper_triangle_inds, eval_energies_by_block);
+  if (output_block_pair_energies || !compute_derivs) {
+    DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
+        mgr, n_poses, max_n_upper_triangle_inds, eval_energies_by_block);
   } else {
-    DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-        mgr, n_poses * max_n_upper_triangle_inds, eval_energies);
+    DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
+        mgr, n_poses, max_n_upper_triangle_inds, eval_energies);
   }
 
   return {output_t, dV_dcoords_t, scratch_rot_neighbors_t};
@@ -912,6 +918,7 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
     // Entry i, j stores path_dist[rep(i), rep(j)]
     // Dimsize: n_block_types x max_n_atoms x max_n_atoms
     TView<Int, 3, D> block_type_intra_repr_path_distance,
+    TView<Int, 1, D> block_type_is_ligand_fragment,
     //////////////////////
 
     // LJ parameters
@@ -1036,6 +1043,10 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
       return;
     }
 
+    if (dTdV[0][pose_ind][block_ind1][block_ind2] == 0) {
+      return;
+    }
+
     int const block_type1 = block_type_ind_for_rot[rot_ind1];
     int const block_type2 = block_type_ind_for_rot[rot_ind2];
 
@@ -1110,8 +1121,8 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
 
   // Since we have the sphere overlap results from the forward pass,
   // there's only a single kernel launch here
-  DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-      mgr, n_poses * max_n_upper_triangle_inds, eval_derivs);
+  DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
+      mgr, n_poses, max_n_upper_triangle_inds, eval_derivs);
 
   return dV_dcoords_t;
 }
@@ -1180,6 +1191,7 @@ auto ElecRotamerScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
     // Entry i, j stores path_dist[rep(i), rep(j)]
     // Dimsize: n_block_types x max_n_atoms x max_n_atoms
     TView<Int, 3, D> block_type_intra_repr_path_distance,
+    TView<Int, 1, D> block_type_is_ligand_fragment,
     //////////////////////
 
     // LJ parameters
@@ -1420,8 +1432,13 @@ auto ElecRotamerScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
   // mgpu::standard_context_t context(wrapped_stream.stream());
 
   // 2
-  DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-      mgr, dispatch_indices.size(1), eval_energies_by_block);
+  if (compute_derivs) {
+    DeviceDispatch<D>::template foreach_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies_by_block);
+  } else {
+    DeviceDispatch<D>::template foreach_independent_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies_by_block);
+  }
 
   return {output_t, dV_dcoords_t, dispatch_indices_t};
 }  // namespace potentials
@@ -1490,6 +1507,7 @@ auto ElecRotamerScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
     // Entry i, j stores path_dist[rep(i), rep(j)]
     // Dimsize: n_block_types x max_n_atoms x max_n_atoms
     TView<Int, 3, D> block_type_intra_repr_path_distance,
+    TView<Int, 1, D> block_type_is_ligand_fragment,
     //////////////////////
 
     // LJ parameters

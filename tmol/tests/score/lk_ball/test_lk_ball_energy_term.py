@@ -2,9 +2,9 @@ import numpy
 import torch
 
 from tmol.io import pose_stack_from_pdb
-from tmol.score.lk_ball.lk_ball_energy_term import LKBallEnergyTerm
+from tmol.score.lk_ball import LKBallEnergyTerm
 
-from tmol.tests.score.common.test_energy_term import EnergyTermTestBase
+from tmol.tests.score.common import EnergyTermTestBase
 
 
 def test_smoke(default_database, torch_device):
@@ -50,7 +50,7 @@ def test_annotate_restypes(
 
 def test_whole_pose_scoring_module_smoke(ubq_pdb, default_database, torch_device):
     gold_vals = numpy.array(
-        [[422.0388], [172.1965], [1.5786], [10.9946]], dtype=numpy.float32
+        [[422.0388], [172.1965], [1.581745], [11.031567]], dtype=numpy.float32
     )
     lk_ball_energy = LKBallEnergyTerm(param_db=default_database, device=torch_device)
     p1 = pose_stack_from_pdb(ubq_pdb, torch_device)

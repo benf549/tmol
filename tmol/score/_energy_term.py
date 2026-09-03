@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from tmol.chemical import RefinedResidueType
+from tmol.pose import (
+    PackedBlockTypes,
+    PoseStack,
+)
+from tmol.score.common import (
+    TermWholePoseScoringModule,
+    TermBlockPairScoringModule,
+    TermRotamerScoringModule,
+    ZeroTermPoseScoringModule,
+)
+
+if TYPE_CHECKING:
+    from tmol.pack.rotamer import RotamerSet
+
+
+class EnergyTerm:
+    """Base protocol for topology setup and rendering of one energy term.
+
+    Subclasses describe their score types and body order, cache topology-only
+    annotations through the ``setup_*`` hooks, and provide callable scoring
+    implementations for whole-pose and rotamer evaluation.
+    """
+
+    def __init__(self, **kwargs):
+        pass
+
+    @classmethod
+    def class_name(self):
+        raise NotImplementedError()
+
+    def score_types(self):
+        """Return the list of score types that this EnergyTerm computes
+
+        The order that the term reports score types in this function should be
+        the same order that it reports the scores themselves in the output
+        tensor"""
+        raise NotImplementedError()
+
+    def n_bodies(self):
+        """Return the number of residues that this term operates on
+
+        1, 2, or -1 to represent the whole structure
+        """
+        raise NotImplementedError()
+
+    def setup_block_type(self, block_type: RefinedResidueType):
+        """Make a one-time CPU annotation on a block type.
+
+        These annotations may require slow string comparisons; they should be
+        performed only once, so the EnergyTerm must check that its annotation
+        is not already present in the block type. Annotations should be in
+        numpy data structures (and stored on the CPU).
+
+        If the annotation requires more than one array, use a Python class to
+        store those arrays.
+
+        If the kind of annotation made depends on data that may change
+        between different instances of the same term, then the annotation
+        should be a map whose key is a function of the perhaps-changing
+        data. The term should calculate that key at its construction to
+        make retrieval efficient. (Any such data that sways how the
+        calculation is made should never change over the lifetime of the
+        instance; if new values for that data are needed a separate
+        instance should be created.)
+        """
+        pass
+
+    def setup_packed_block_types(self, packed_block_types: PackedBlockTypes):
+        """Make a one-time device annotation of the packed block types.
+
+        Implementations generally pack the residue-type NumPy annotations into
+        tensors whose first dimension follows ``active_block_types``. Pad
+        variable residue dimensions with a sentinel such as ``-1`` and cache
+        all tensors on the packed block types' device. If setup depends on
+        instance-specific parameters, key the cached annotation by those
+        immutable parameters so distinct term instances cannot reuse
+        incompatible data.
+        """
+        pass
+
+    def setup_poses(self, pose_stack: PoseStack):
+        """Make a one-time annotation of a PoseStack. These annotations should
+        not depend on anything about the conformation or block-type identity of
+        the PoseStack, but can depend on the chemical connectivity, the number
+        of poses in the stack, and the maximum number of atoms in the stack.
+
+        Any array data should be stored in torch tensors and live on the
+        pose_stack's device.
+        """
+        pass
+
+    def set_options(self, options: dict):
+        """Receive a dictionary of options from the ScoreFunction.
+
+        Subclasses may override this method to extract configuration values
+        that affect scoring behavior, such as boolean flags, numeric
+        parameters, or other settings. The base implementation is a no-op.
+        """
+        pass
+
+    def get_score_term_attributes(self, pose_stack: PoseStack):
+        raise NotImplementedError()
+
+    def get_pose_score_term_function(self):
+        raise NotImplementedError()
+
+    def get_rotamer_score_term_function(self):
+        raise NotImplementedError()
+
+    def pose_score_term_is_invariant_zero(self, pose_stack: PoseStack):
+        """Whether this term is identically zero for this fixed pose topology."""
+        return False
+
+    def render_whole_pose_scoring_module(self, pose_stack: PoseStack):
+        if self.pose_score_term_is_invariant_zero(pose_stack):
+            return ZeroTermPoseScoringModule(
+                self.class_name(),
+                len(self.score_types()),
+                pose_stack.n_poses,
+                pose_stack.device,
+            )
+        f = self.get_pose_score_term_function()
+
+        return TermWholePoseScoringModule(
+            self.class_name(),
+            pose_stack,
+            self.get_score_term_attributes(pose_stack),
+            f,
+        )
+
+    def render_block_pair_scoring_module(self, pose_stack: PoseStack):
+        if self.pose_score_term_is_invariant_zero(pose_stack):
+            return ZeroTermPoseScoringModule(
+                self.class_name(),
+                len(self.score_types()),
+                pose_stack.n_poses,
+                pose_stack.device,
+                pose_stack.max_n_blocks,
+            )
+        f = self.get_pose_score_term_function()
+        return TermBlockPairScoringModule(
+            self.class_name(),
+            pose_stack,
+            self.get_score_term_attributes(pose_stack),
+            f,
+        )
+
+    def render_rotamer_scoring_module(
+        self, pose_stack: PoseStack, rotamer_set: RotamerSet
+    ):
+        try:
+            f = self.get_rotamer_score_term_function()
+        except NotImplementedError:
+            f = self.get_score_term_function()
+
+        return TermRotamerScoringModule(
+            self.class_name(),
+            rotamer_set,
+            self.get_score_term_attributes(pose_stack),
+            f,
+        )

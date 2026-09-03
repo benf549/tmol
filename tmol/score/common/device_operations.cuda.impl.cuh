@@ -40,18 +40,31 @@ struct DeviceOperations<tmol::Device::CUDA> {
     mgpu::transform<launch_t>(f, N, *context);
   }
 
-  template <typename Int, typename Func>
-  static void forall_stacks(ContextManager& mgr, Int Nstacks, Int N, Func f) {
-    std::shared_ptr<mgpu::standard_context_t> context = _get_context(mgr);
-    // mgpu::standard_context_t context;
-    mgpu::transform(
-        [=] MGPU_DEVICE(int index) {
-          int stack = index / N;
-          int i = index % N;
-          f(stack, i);
-        },
-        N * Nstacks,
-        *context);
+  template <typename launch_t, typename Func>
+  static void forall_independent(ContextManager& mgr, int N, Func f) {
+    forall<launch_t>(mgr, N, f);
+  }
+
+  template <typename launch_t, typename Func>
+  static void forall_grouped(
+      ContextManager& mgr, int n_groups, int items_per_group, Func f) {
+    forall<launch_t>(mgr, n_groups * items_per_group, f);
+  }
+
+  static EIGEN_DEVICE_FUNC void store_idempotent(
+      int32_t& target, int32_t value) {
+#ifdef __CUDA_ARCH__
+    atomicExch(&target, value);
+#endif
+  }
+
+  static EIGEN_DEVICE_FUNC void store_idempotent(
+      int64_t& target, int64_t value) {
+#ifdef __CUDA_ARCH__
+    atomicExch(
+        reinterpret_cast<unsigned long long*>(&target),
+        static_cast<unsigned long long>(value));
+#endif
   }
 
   template <typename Int, typename Func>
@@ -77,6 +90,24 @@ struct DeviceOperations<tmol::Device::CUDA> {
     // mgpu::standard_context_t context;
     std::shared_ptr<mgpu::standard_context_t> context = _get_context(mgr);
     mgpu::cta_launch<launch_t>(wrapper, n_workgroups, *context);
+  }
+
+  template <typename launch_t, typename Func>
+  static void foreach_independent_workgroup(
+      ContextManager& mgr, int n_workgroups, Func f) {
+    foreach_workgroup<launch_t>(mgr, n_workgroups, f);
+  }
+
+  template <typename launch_t, typename Func>
+  static void foreach_grouped_workgroup(
+      ContextManager& mgr, int n_groups, int workgroups_per_group, Func f) {
+    foreach_workgroup<launch_t>(mgr, n_groups * workgroups_per_group, f);
+  }
+
+  template <typename launch_t, typename Func>
+  static void foreach_pose_workgroup(
+      ContextManager& mgr, int n_poses, int workgroups_per_pose, Func f) {
+    foreach_grouped_workgroup<launch_t>(mgr, n_poses, workgroups_per_pose, f);
   }
 
   template <mgpu::scan_type_t scan_type, typename T, typename OP>
@@ -142,12 +173,7 @@ struct DeviceOperations<tmol::Device::CUDA> {
   // than, e.g., a boolean tensor indicating the start of each segment.
   // The identity value (e.g. 0) must be given because pre-initialization is not
   // always possible. seg_starts_inds must be sorted in ascending order.
-  template <
-      mgpu::scan_type_t scan_type,
-      typename launch_t,
-      typename T,
-      typename Int,
-      typename OP>
+  template <mgpu::scan_type_t scan_type, typename T, typename Int, typename OP>
   static auto segmented_scan(
       ContextManager& mgr,
       T* src,
@@ -157,12 +183,16 @@ struct DeviceOperations<tmol::Device::CUDA> {
       OP op,
       T identity) -> TPack<T, 1, tmol::Device::CUDA> {
     // mgpu::standard_context_t context;
+    typedef typename mgpu::launch_params_t<128, 2> launch_t;
+
     std::shared_ptr<mgpu::standard_context_t> context = _get_context(mgr);
 
     int const nt = launch_t::nt;
     int const vt = launch_t::vt;
 
-    auto src_indexing = [=] MGPU_DEVICE(int i) { return src[i]; };
+    auto src_indexing = [=] MGPU_DEVICE(int i, int _seg, int _rank) {
+      return src[i];
+    };
 
     // Copying Frank's code from kinematics/compiled/compiled.cuda.cuh
     int const scanBuffer = n + n_segs;
@@ -178,16 +208,16 @@ struct DeviceOperations<tmol::Device::CUDA> {
         TPack<T, 1, tmol::Device::CUDA>::empty({carryoutBuffer});
     auto scanCarryout = scanCarryout_t.view;
     auto scanCodes_t =
-        TPack<Int, 1, tmol::Device::CUDA>::empty({carryoutBuffer});
+        TPack<int, 1, tmol::Device::CUDA>::empty({carryoutBuffer});
     auto scanCodes = scanCodes_t.view;
-    auto LBS_t = TPack<Int, 1, tmol::Device::CUDA>::empty({lbsBuffer});
+    auto LBS_t = TPack<int, 1, tmol::Device::CUDA>::empty({lbsBuffer});
     auto LBS = LBS_t.view;
 
     // The return tensor
-    auto dst_scan_t = TPack<T, 1, tmol::Device::CUDA>::empty({scanBuffer});
+    auto dst_scan_t = TPack<T, 1, tmol::Device::CUDA>::empty({n});
     auto dst_scan = dst_scan_t.view;
 
-    tmol::kinematics::kernel_segscan<launch_t>(
+    tmol::kinematics::kernel_segscan<launch_t, scan_type>(
         src_indexing,
         n,
         &seg_start_inds[0],

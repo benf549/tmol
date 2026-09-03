@@ -1,7 +1,9 @@
 import numpy
 import torch
+from types import SimpleNamespace
 
-from tmol.pack.rotamer.build_rotamers import (
+from tmol.pack.rotamer import (
+    _build_chi4_atom_table,
     annotate_restype,
     annotate_packed_block_types,
     build_rotamers,
@@ -10,39 +12,67 @@ from tmol.pack.rotamer.build_rotamers import (
     exc_cumsum_from_inc_cumsum,
     measure_pose_dofs,
     measure_dofs_from_orig_coords,
-    rebuild_poses_if_necessary,
     annotate_everything,
     merge_conformer_samples,
     calculate_rotamer_coords,
     get_rotamer_origin_data,
-)
-from tmol.pack.rotamer.chi_sampler import (
+    load_rotamer_parents,
     create_dof_inds_to_copy_from_orig_to_rotamers_for_sampler,
-)
-
-from tmol.pack.rotamer.fixed_aa_chi_sampler import (
     FixedAAChiSampler,
 )
 
-
 from tmol.io import pose_stack_from_pdb
 
-from tmol.pose.packed_block_types import PackedBlockTypes
-from tmol.pose.pose_stack_builder import PoseStackBuilder
-from tmol.pack.packer_task import PackerTask, PackerPalette
+from tmol.pose import (
+    PackedBlockTypes,
+    PoseStackBuilder,
+)
+from tmol.pack import PackerTask, PackerPalette, SetPackerTask
 
-from tmol.kinematics.compiled.compiled_ops import forward_only_op
+from tmol.kinematics.compiled import forward_only_op
 
-from tmol.utility.tensor.common_operations import exclusive_cumsum1d, stretch
+from tmol.utility.tensor import exclusive_cumsum1d, stretch
 
 from tmol.tests.data import no_termini_pose_stack_from_pdb
 
-from tmol.score.hbond.hbond_energy_term import (
+from tmol.score.hbond import (
     HBondEnergyTerm,
 )
 
-# TEMP
-from tmol.io.pdb_parsing import atom_record_dtype
+
+def test_chi_atom_table_orders_double_digit_chis_numerically():
+    restype = SimpleNamespace(
+        torsion_to_uaids={
+            "chi1": ((1,), (2,), (3,), (4,)),
+            "chi10": ((9,), (10,), (11,), (12,)),
+            "chi2": ((5,), (6,), (7,), (8,)),
+        }
+    )
+    pbt = SimpleNamespace(n_types=1, active_block_types=[restype])
+
+    table = _build_chi4_atom_table(pbt)
+
+    numpy.testing.assert_array_equal(
+        table[0],
+        numpy.array(
+            [
+                [1, 2, 3, 4],
+                [5, 6, 7, 8],
+                [9, 10, 11, 12],
+            ],
+            dtype=numpy.int32,
+        ),
+    )
+
+
+def test_load_rotamer_parents_accepts_empty_conformer():
+    parents = numpy.zeros((1, 1), dtype=numpy.int32)
+    n_atoms = numpy.zeros(1, dtype=numpy.int32)
+    offsets = numpy.zeros(1, dtype=numpy.int64)
+
+    compact = load_rotamer_parents(parents, 0, n_atoms, offsets)
+
+    numpy.testing.assert_array_equal(compact, numpy.zeros(1, dtype=numpy.int32))
 
 
 def test_annotate_restypes(
@@ -75,16 +105,22 @@ def test_build_rotamers_smoke(default_database, ubq_pdb, torch_device, dun_sampl
     p2 = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=10)
 
     poses = PoseStackBuilder.from_poses([p1, p2], torch_device)
-    restype_set = poses.packed_block_types.restype_set
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
 
     poses, rotamer_set = build_rotamers(poses, task, default_database.chemical)
-    assert rotamer_set is not None
+    _, cached_rotamer_set = build_rotamers(poses, task, default_database.chemical)
+
+    torch.testing.assert_close(cached_rotamer_set.coords, rotamer_set.coords)
+    torch.testing.assert_close(
+        cached_rotamer_set.block_type_ind_for_rot,
+        rotamer_set.block_type_ind_for_rot,
+    )
 
 
 def test_construct_scans_for_rotamers(
@@ -295,12 +331,10 @@ def test_measure_pose_dofs(default_database, ubq_pdb, torch_device, dun_sampler)
         n_atoms_offset_for_conformer,
     )
 
-    n_conformers = poses.max_n_blocks
     n_atoms_total = poses.max_n_pose_atoms
 
     rotamer_coords = calculate_rotamer_coords(
         pbt,
-        n_conformers,
         n_atoms_total,
         orig_kinforest,
         nodes,
@@ -660,8 +694,8 @@ def test_measure_original_dofs(default_database, ubq_pdb, torch_device, dun_samp
 
     poses = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=25)
 
-    restype_set = poses.packed_block_types.restype_set
-    palette = PackerPalette(restype_set)
+    # restype_set = poses.packed_block_types.restype_set
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
@@ -676,9 +710,6 @@ def test_measure_original_dofs(default_database, ubq_pdb, torch_device, dun_samp
     annotate_packed_block_types(pbt)
 
     block_type_ind = poses.block_type_ind.view(-1)
-    # real_block_type_ind = block_type_ind != -1
-    # nz_real_block_type_ind = torch.nonzero(real_block_type_ind).flatten()
-    # real_block_type_ind_numpy = nz_real_block_type_ind.cpu().numpy().astype(numpy.int32)
     block_type_ind = block_type_ind[block_type_ind != -1]
     block_type_ind_numpy = block_type_ind.cpu().numpy()
     res_n_atoms = pbt.n_atoms[block_type_ind.to(torch.int64)]
@@ -741,14 +772,14 @@ def test_measure_original_dofs2(default_database, ubq_pdb, torch_device, dun_sam
     p2 = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
 
     poses = PoseStackBuilder.from_poses([p1, p2], torch_device)
-    restype_set = poses.packed_block_types.restype_set
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
     samplers = (dun_sampler, fixed_sampler)
 
     pbt = poses.packed_block_types
@@ -758,7 +789,6 @@ def test_measure_original_dofs2(default_database, ubq_pdb, torch_device, dun_sam
 
     block_type_ind = poses.block_type_ind.view(-1)
     real_block_type_ind = block_type_ind != -1
-    # nz_real_block_type_ind = torch.nonzero(real_block_type_ind).flatten()
     block_type_ind = block_type_ind[block_type_ind != -1]
     res_n_atoms = pbt.n_atoms[block_type_ind.to(torch.int64)]
     n_total_atoms = torch.sum(res_n_atoms).item()
@@ -857,24 +887,23 @@ def test_create_dof_inds_to_copy_from_orig_to_rotamers(
         ubq_pdb, torch_device, residue_start=1, residue_end=4
     )
     poses = PoseStackBuilder.from_poses([p1, p2], torch_device)
-    restype_set = poses.packed_block_types.restype_set
+    # restype_set = poses.packed_block_types.restype_set
 
     pbt = poses.packed_block_types
     pbt_namelist = [x.name for x in pbt.active_block_types]
     # assert "LEU" not in pbt_namelist
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     leu_set = set(["LEU"])
-    for one_pose_blts in task.blts:
-        for blt in one_pose_blts:
-            blt.restrict_absent_name3s(leu_set)
+    task.restrict_absent_name3s(leu_set)
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
 
-    poses, samplers = rebuild_poses_if_necessary(poses, task)
+    samplers = tuple(task.conformer_samplers)
     pbt = poses.packed_block_types
 
     pbt_namelist = [x.name for x in pbt.active_block_types]
@@ -959,19 +988,18 @@ def test_create_dof_inds_to_copy_from_orig_to_rotamers2(
 ):
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=6)
     poses = PoseStackBuilder.from_poses([p] * 3, torch_device)
-    restype_set = poses.packed_block_types.restype_set
-    palette = PackerPalette(restype_set)
+    # restype_set = poses.packed_block_types.restype_set
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     gbt_for_rot_list = []
     count_gbt = 0
 
-    for i, one_pose_blts in enumerate(task.blts):
-        for j, blt in enumerate(one_pose_blts):
-            for k, bt in enumerate(blt.considered_block_types):
-                if blt.block_type_allowed[k]:
-                    # print("allowed block type", i, j, k, bt.name)
+    for i in range(3):
+        for j in range(poses.max_n_blocks):
+            for k in range(task.per_block_is_block_type_allowed.shape[2]):
+                if task.per_block_is_block_type_allowed[i, j, k]:
                     gbt_for_rot_list.append(count_gbt)
                     gbt_for_rot_list.append(count_gbt)
                 count_gbt += 1
@@ -979,8 +1007,9 @@ def test_create_dof_inds_to_copy_from_orig_to_rotamers2(
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
 
-    poses, samplers = rebuild_poses_if_necessary(poses, task)
+    samplers = tuple(task.conformer_samplers)
     pbt = poses.packed_block_types
     annotate_everything(default_database.chemical, samplers, pbt)
 
@@ -1041,61 +1070,65 @@ def test_create_dof_inds_to_copy_from_orig_to_rotamers2(
     numpy.testing.assert_equal(dst0 - 1, dst2 - 1 - 2 * n_rot_ats_per_pose)
 
 
-def test_build_some_rotamers(default_database, ubq_pdb, torch_device, dun_sampler):
-
+def test_write_rotamers_pdb(default_database, ubq_pdb, torch_device, dun_sampler):
     poses = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=75)
-    restype_set = poses.packed_block_types.restype_set
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
 
     poses, rotamer_set = build_rotamers(poses, task, default_database.chemical)
     pbt = poses.packed_block_types
 
-    # we are going to create a list of atom records for each rotamer
-    # and write them out as a multi-model pdb
-    n_atoms_total = rotamer_set.coords.shape[0]
-    atom_records = numpy.empty((n_atoms_total,), dtype=atom_record_dtype)
-    n_rots = rotamer_set.block_type_ind_for_rot.shape[0]
+    atom_array = rotamer_set.to_atom_array(pbt)
+    model_annotation = atom_array.get_annotation("model")
+
+    n_rots = rotamer_set.n_rotamers_total
+    assert len(numpy.unique(model_annotation)) == n_rots
 
     for i in range(n_rots):
-        i_offset = rotamer_set.coord_offset_for_rot[i]
-        block_type_ind = rotamer_set.block_type_ind_for_rot[i]
-        n_atoms_for_block_type = pbt.n_atoms[block_type_ind]
-        for j in range(n_atoms_for_block_type):
-            atom_records[i_offset + j]["modeli"] = i  # model number
-            atom_records[i_offset + j]["chaini"] = 0  # chain id
-            atom_records[i_offset + j]["resi"] = (
-                rotamer_set.block_ind_for_rot[i] + 1
-            )  # residue number
-            atom_records[i_offset + j]["atomi"] = j + 1  # atom number
-            atom_records[i_offset + j]["model"] = f"M{i:05d}"  # model name
-            atom_records[i_offset + j]["chain"] = "A"  # chain id
-            atom_records[i_offset + j]["resn"] = pbt.active_block_types[
-                block_type_ind
-            ].name3
-            atom_records[i_offset + j]["atomn"] = (
-                pbt.active_block_types[block_type_ind].atoms[j].name
-            )
-            atom_records[i_offset + j]["x"] = rotamer_set.coords[i_offset + j, 0].item()
-            atom_records[i_offset + j]["y"] = rotamer_set.coords[i_offset + j, 1].item()
-            atom_records[i_offset + j]["z"] = rotamer_set.coords[i_offset + j, 2].item()
-            atom_records[i_offset + j]["insert"] = ""  # insert code
-            atom_records[i_offset + j]["occupancy"] = 1.0  # occupancy
-            atom_records[i_offset + j]["b"] = 0.0  # B-factor
+        n_atoms_in_model = numpy.sum(model_annotation == i)
+        n_atoms_expected = pbt.n_atoms[rotamer_set.block_type_ind_for_rot[i]].item()
+        assert n_atoms_in_model == n_atoms_expected
+
+
+def test_build_some_rotamers(default_database, ubq_pdb, torch_device, dun_sampler):
+
+    poses = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=75)
+    # restype_set = poses.packed_block_types.restype_set
+
+    palette = PackerPalette()
+    task = PackerTask(poses, palette)
+    task.restrict_to_repacking()
+
+    fixed_sampler = FixedAAChiSampler()
+    task.add_conformer_sampler(dun_sampler)
+    task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
+
+    poses, rotamer_set = build_rotamers(poses, task, default_database.chemical)
+    pbt = poses.packed_block_types
+
+    atom_array = rotamer_set.to_atom_array(pbt)
 
     # uncomment if rotgen changes
-    # with open("test_build_rotamers.pdb", "w") as fid:
-    #    fid.writelines(to_pdb_lines(atom_records))
+    # import biotite.structure.io.pdb as pdb_io
+    # model_annotation = atom_array.get_annotation("model")
+    # pdb_file = pdb_io.PDBFile()
+    # for model_idx in numpy.unique(model_annotation):
+    #     pdb_file.set_structure(
+    #         atom_array[model_annotation == model_idx], model=int(model_idx) + 1
+    #     )
+    # pdb_file.write("tmol/tests/pack/rotamer/gold_repack_1ubq_rotamers.pdb")
 
-    def parse_atom_coords(lines):
+    def parse_atom_coords(text):
         coords = []
-        for line in lines:
+        for line in text.splitlines():
             if line.startswith("ATOM"):
                 coords.append(
                     (float(line[30:38]), float(line[38:46]), float(line[46:54]))
@@ -1103,34 +1136,25 @@ def test_build_some_rotamers(default_database, ubq_pdb, torch_device, dun_sample
         return numpy.array(coords)
 
     with open("tmol/tests/pack/rotamer/gold_repack_1ubq_rotamers.pdb") as fid:
-        gold_coords = parse_atom_coords(fid.readlines())
-    test_coords = numpy.stack(
-        [atom_records["x"], atom_records["y"], atom_records["z"]], axis=-1
-    )
-    assert gold_coords.shape == test_coords.shape
-    numpy.testing.assert_allclose(test_coords, gold_coords, atol=1e-3)
+        gold_coords = parse_atom_coords(fid.read())
+    assert gold_coords.shape == atom_array.coord.shape
+    numpy.testing.assert_allclose(atom_array.coord, gold_coords, atol=1e-3)
 
 
 def test_build_lots_of_rotamers(default_database, ubq_pdb, torch_device, dun_sampler):
     n_poses = 2
-
-    # fd TEMP: NO TERM VARIANTS
-    # p = no_termini_pose_stack_from_pdb(
-    #     ubq_pdb, torch_device, residue_start=1, residue_end=14
-    # )
-    # APL Actually, term variants are totally fine now
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
 
     poses = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
-    restype_set = poses.packed_block_types.restype_set
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
 
     poses, rotamer_set = build_rotamers(poses, task, default_database.chemical)
     numpy.testing.assert_array_less(
@@ -1154,24 +1178,25 @@ def test_build_lots_of_rotamers(default_database, ubq_pdb, torch_device, dun_sam
         )
 
 
-def test_score_lots_of_rotamers(default_database, ubq_pdb, torch_device, dun_sampler):
+def test_score_lots_of_rotamers(
+    default_database, ubq_pdb, torch_device, dun_sampler
+):  # noqa: C901
     n_poses = 2
 
-    # fd TEMP: NO TERM VARIANTS
     p = no_termini_pose_stack_from_pdb(
         ubq_pdb, torch_device, residue_start=1, residue_end=14
     )
 
     poses = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
-    restype_set = poses.packed_block_types.restype_set
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
 
     poses, rotamer_set = build_rotamers(poses, task, default_database.chemical)
     numpy.testing.assert_array_less(
@@ -1259,15 +1284,15 @@ def test_create_dofs_for_many_rotamers(
     n_poses = 6
 
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
-    restype_set = p.packed_block_types.restype_set
     poses = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
     chem_db = default_database.chemical
 
     ###########################################
@@ -1275,26 +1300,14 @@ def test_create_dofs_for_many_rotamers(
     # up to the coordinate calc
     ###########################################
     # Step 1
-    poses, samplers = rebuild_poses_if_necessary(poses, task)
+    samplers = tuple(task.conformer_samplers)
     pbt = poses.packed_block_types
 
     # Step 2
     annotate_everything(chem_db, samplers, pbt)
 
     # Step 3
-    # create a list of the name of every considered block type at every block in every
-    # pose so that we can then create an integer version of that same data;
-    # the "global block type" (gbt) if you will. The order in which these block-
-    # types appear will be used as an index for talking about which rotamers are
-    # built where. This cannot be efficient. Perhaps worth thinking hard about the
-    # PackerTask's structure.
-    gbt_names = [
-        bt.name
-        for one_pose_blts in task.blts
-        for blt in one_pose_blts
-        for bt in blt.considered_block_types
-    ]
-    gbt_block_type_ind = pbt.restype_index.get_indexer(gbt_names).astype(numpy.int32)
+    gbt_block_type_ind = task.cons_bt_block_type.cpu().numpy().astype(numpy.int32)
 
     # Step 4
     conformer_samples = [
@@ -1364,8 +1377,7 @@ def test_create_dofs_for_many_rotamers(
     )
     conf_dofs_kto[1:] = torch.tensor(
         pbt.rotamer_kinforest.dofs_ideal[block_type_ind_for_conformer].reshape((-1, 9))[
-            pbt.atom_is_real.cpu().numpy()[block_type_ind_for_conformer].reshape(-1)
-            != 0
+            pbt.atom_is_real[block_type_ind_for_conformer].reshape(-1) != 0
         ],
         dtype=torch.float32,
         device=pbt.device,
@@ -1416,36 +1428,31 @@ def test_new_rotamer_building_logic1(
 ):
     n_poses = 6
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
-    restype_set = p.packed_block_types.restype_set
     poses = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
+
     chem_db = default_database.chemical
     ###########################################
     # Now the contents of build rotamers right
     ###########################################
 
     # Step 1
-    poses, samplers = rebuild_poses_if_necessary(poses, task)
+    samplers = tuple(task.conformer_samplers)
     pbt = poses.packed_block_types
 
     # Step 2
     annotate_everything(chem_db, samplers, pbt)
 
     # Step 3
-    gbt_names = [
-        bt.name
-        for one_pose_blts in task.blts
-        for blt in one_pose_blts
-        for bt in blt.considered_block_types
-    ]
-    gbt_block_type_ind = pbt.restype_index.get_indexer(gbt_names).astype(numpy.int32)
+    gbt_block_type_ind = task.cons_bt_block_type.cpu().numpy().astype(numpy.int32)
 
     # Step 4
     conformer_samples = [
@@ -1467,8 +1474,6 @@ def test_new_rotamer_building_logic1(
     gbt_for_conformer_np = gbt_for_conformer.cpu().numpy()
 
     gbt_for_conformer_torch = _t(gbt_for_conformer, torch.int64)
-
-    n_conformers = sampler_for_conformer.shape[0]
 
     block_type_ind_for_conformer = gbt_block_type_ind[gbt_for_conformer_np]
     block_type_ind_for_conformer_torch = _t(block_type_ind_for_conformer, torch.int64)
@@ -1508,8 +1513,7 @@ def test_new_rotamer_building_logic1(
     )
     conf_dofs_kto[1:] = torch.tensor(
         pbt.rotamer_kinforest.dofs_ideal[block_type_ind_for_conformer].reshape((-1, 9))[
-            pbt.atom_is_real.cpu().numpy()[block_type_ind_for_conformer].reshape(-1)
-            != 0
+            pbt.atom_is_real[block_type_ind_for_conformer].reshape(-1) != 0
         ],
         dtype=torch.float32,
         device=pbt.device,
@@ -1534,7 +1538,6 @@ def test_new_rotamer_building_logic1(
 
     rotamer_coords = calculate_rotamer_coords(
         pbt,
-        n_conformers,
         n_atoms_total,
         conformer_kinforest,
         nodes,
@@ -1559,16 +1562,16 @@ def test_new_rotamer_building_logic2(
 ):
     n_poses = 6
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
-    restype_set = p.packed_block_types.restype_set
     poses = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
     chem_db = default_database.chemical
     ###########################################
 
@@ -1580,10 +1583,9 @@ def test_new_rotamer_building_logic3(
 ):
     n_poses = 6
     p = pose_stack_from_pdb(ubq_pdb, torch_device, residue_start=0, residue_end=76)
-    restype_set = p.packed_block_types.restype_set
     poses = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
 
-    palette = PackerPalette(restype_set)
+    palette = PackerPalette()
     task = PackerTask(poses, palette)
     task.restrict_to_repacking()
 
@@ -1615,11 +1617,13 @@ def test_new_rotamer_building_logic3(
         (1, 52),
     ]
     for pose, res in residues_to_fix:
-        task.blts[pose][res].disable_packing()
+        task.per_block_is_block_type_allowed[pose, res, :] = False
 
     fixed_sampler = FixedAAChiSampler()
     task.add_conformer_sampler(dun_sampler)
     task.add_conformer_sampler(fixed_sampler)
+    task = SetPackerTask.from_packer_task(task)
+
     chem_db = default_database.chemical
     ###########################################
 

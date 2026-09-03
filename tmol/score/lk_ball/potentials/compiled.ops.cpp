@@ -5,8 +5,6 @@
 #include <tmol/utility/tensor/context_manager.hh>
 #include <tmol/utility/function_dispatch/aten.hh>
 
-#include <tmol/score/common/simple_dispatch.hh>
-#include <tmol/score/common/forall_dispatch.hh>
 #include <tmol/score/common/device_operations.hh>
 
 #include "gen_pose_waters.hh"
@@ -729,8 +727,6 @@ class LKBallRotamerScoreOp
          water_coords,
          dispatch_indices});
 
-    ctx->saved_data["block_pair_scoring"] = output_block_pair_energies;
-
     return {score, dispatch_indices};
   }
 
@@ -776,8 +772,6 @@ class LKBallRotamerScoreOp
 
     auto dTdV = grad_outputs[0];
 
-    bool block_pair_scoring = ctx->saved_data["block_pair_scoring"].toBool();
-
     TMOL_DISPATCH_FLOATING_DEVICE(
         rot_coords.options(), "lk_ball_rotamer_score_backward", ([&] {
           using Real = scalar_t;
@@ -820,8 +814,7 @@ class LKBallRotamerScoreOp
 
                   TCAST(global_params),
                   TCAST(dispatch_indices),
-                  TCAST(dTdV),
-                  block_pair_scoring);
+                  TCAST(dTdV));
 
           dV_d_pose_coords = std::get<0>(result).tensor;
           dV_d_water_coords = std::get<1>(result).tensor;

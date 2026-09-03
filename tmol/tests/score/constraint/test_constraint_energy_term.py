@@ -3,11 +3,13 @@ import numpy
 import torch
 import math
 import pytest
+import sys
+import types
 
-from tmol.pose.constraint_set import ConstraintSet
-from tmol.score.constraint.constraint_energy_term import ConstraintEnergyTerm
-
-from tmol.tests.score.common.test_energy_term import EnergyTermTestBase
+from tmol.pose import ConstraintSet
+from tmol.score.constraint import ConstraintEnergyTerm
+from tmol.tests.score.common import EnergyTermTestBase
+from tmol import pose_stack_from_pdb, ScoreFunction, ScoreType
 
 
 def add_test_constraints_to_pose_stack(pose_stack):
@@ -139,6 +141,46 @@ def test_get_torsion_angle(torch_device):
     gold_vals = torch.tensor([-3.141593, 0.0])
     angles = ConstraintEnergyTerm.get_torsion_angle_test(tnsor)
     numpy.testing.assert_allclose(gold_vals.cpu(), angles.cpu(), atol=1e-5, rtol=1e-5)
+
+
+def _circularharmonic_from_angles(monkeypatch, angles, x0, sd=0.5, offset=1.25):
+    module_name = "tmol.score.constraint.potentials._compiled"
+    compiled = types.ModuleType(module_name)
+
+    def get_torsion_angle(atoms):
+        return atoms[:, 0, 0]
+
+    compiled.get_torsion_angle = get_torsion_angle
+    monkeypatch.setitem(sys.modules, module_name, compiled)
+
+    atoms = torch.zeros((len(angles), 4, 3), dtype=torch.float64)
+    atoms[:, 0, 0] = torch.tensor(angles, dtype=atoms.dtype)
+    atoms.requires_grad_()
+    params = torch.tensor([x0, sd, offset], dtype=atoms.dtype).repeat(len(angles), 1)
+
+    scores = ConstraintEnergyTerm.circularharmonic(atoms, params)
+    scores.sum().backward()
+    return scores.detach(), atoms.grad[:, 0, 0]
+
+
+def test_circularharmonic_periodic_values_and_derivatives(monkeypatch):
+    x0 = 0.2
+    x = 0.7
+    scores, derivatives = _circularharmonic_from_angles(
+        monkeypatch, [x - 2 * math.pi, x, x + 2 * math.pi], x0
+    )
+
+    torch.testing.assert_close(scores, torch.full_like(scores, 2.25))
+    torch.testing.assert_close(derivatives, torch.full_like(derivatives, 4.0))
+
+
+def test_circularharmonic_minus_pi_plus_pi_branch_equivalence(monkeypatch):
+    scores, derivatives = _circularharmonic_from_angles(
+        monkeypatch, [-math.pi, math.pi], math.pi - 0.4
+    )
+
+    torch.testing.assert_close(scores, torch.full_like(scores, 1.89))
+    torch.testing.assert_close(derivatives, torch.full_like(derivatives, 3.2))
 
 
 def add_constraints_to_all_poses(pose_stack):
@@ -313,3 +355,77 @@ class TestConstraintEnergyTerm(EnergyTermTestBase):
             atol=5e-4,
             rtol=5e-4,
         )
+
+
+def test_create_coordinate_constraints(
+    ubq_pdb, kin_minimized_ubq_pdb, default_database, torch_device
+):
+    ps = pose_stack_from_pdb(ubq_pdb, device=torch_device)
+    pbt = ps.packed_block_types
+    constraints = ps.get_constraint_set()
+    if constraints is None:
+        constraints = ConstraintSet.create_empty(
+            device=torch_device, n_poses=ps.n_poses
+        )
+
+    is_heavy_atom = torch.zeros(
+        (ps.n_poses, ps.max_n_blocks, ps.max_n_block_atoms),
+        dtype=torch.bool,
+        device=torch_device,
+    )
+    is_real_block = ps.block_type_ind64 != -1
+
+    is_heavy_atom[is_real_block, :] = torch.logical_and(
+        pbt.atom_is_real[ps.block_type_ind64[is_real_block]].to(torch.bool),
+        ~pbt.atom_is_hydrogen[ps.block_type_ind64[is_real_block]].to(torch.bool),
+    )
+    heavy_atom_inds = torch.nonzero(is_heavy_atom, as_tuple=True)
+    heavy_atom_inds = torch.stack(heavy_atom_inds, dim=1).unsqueeze(1)
+
+    expanded_coords, _ = ps.expand_coords()
+    target_coords = expanded_coords[is_heavy_atom]
+    n_constrained_atoms = target_coords.size(0)
+    cst_params = torch.full(
+        (n_constrained_atoms, 5), 0, dtype=torch.float32, device=torch_device
+    )
+    cst_params[:, 1:4] = target_coords
+    cst_params[:, 4] = 1.0
+
+    constraints = constraints.add_constraints(
+        ConstraintEnergyTerm.harmonic_coordinate,
+        heavy_atom_inds,
+        cst_params,
+    )
+    ps = attrs.evolve(
+        ps,
+        constraint_set=constraints,
+    )
+
+    cst_sfxn = ScoreFunction(default_database.scoring, torch_device)
+    cst_sfxn.set_weight(ScoreType.constraint, 1.0)
+    wpsm = cst_sfxn.render_whole_pose_scoring_module(ps)
+    s = wpsm(ps.coords)
+    torch.testing.assert_close(s, torch.tensor([0.0], device=torch_device))
+
+    ps2 = pose_stack_from_pdb(kin_minimized_ubq_pdb, device=torch_device)
+    constraints2 = ps2.get_constraint_set()
+    if constraints2 is None:
+        constraints2 = ConstraintSet.create_empty(
+            device=torch_device, n_poses=ps2.n_poses
+        )
+
+    constraints2 = constraints2.add_constraints(
+        ConstraintEnergyTerm.harmonic_coordinate,
+        heavy_atom_inds,
+        cst_params,
+    )
+    ps2 = attrs.evolve(
+        ps2,
+        constraint_set=constraints2,
+    )
+
+    wpsm = cst_sfxn.render_whole_pose_scoring_module(ps2)
+    s2 = wpsm(ps2.coords)
+    torch.testing.assert_close(
+        s2, torch.tensor([4554.6299], device=torch_device), atol=1e-3, rtol=1e-3
+    )

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include <tmol/utility/tensor/TensorAccessor.h>
 #include <tmol/utility/tensor/TensorUtil.h>
 
@@ -11,7 +13,7 @@ namespace potentials {
 template <typename Real>
 struct LJTypeParams {
   Real lj_radius;
-  Real lj_wdepth;
+  Real lj_sqrt_wdepth;
   Real is_donor;
   Real is_hydroxyl;
   Real is_polarh;
@@ -28,12 +30,15 @@ struct LKTypeParams {
   Real is_hydroxyl;
   Real is_polarh;
   Real is_acceptor;
+  Real is_carbon_lk;
+  Real lk_coeff;
+  Real lk_inv_lambda2;
 };
 
 template <typename Real>
 struct LJLKTypeParams {
   Real lj_radius;
-  Real lj_wdepth;
+  Real lj_sqrt_wdepth;
   Real lk_dgfree;
   Real lk_lambda;
   Real lk_volume;
@@ -41,13 +46,22 @@ struct LJLKTypeParams {
   Real is_hydroxyl;
   Real is_polarh;
   Real is_acceptor;
+  Real is_carbon_lk;
+  Real is_hydrogen;
+  Real lk_coeff;
+  Real lk_inv_lambda2;
 
-  LJTypeParams<Real> EIGEN_DEVICE_FUNC lj_params() {
+  LJTypeParams<Real> EIGEN_DEVICE_FUNC lj_params() const {
     return LJTypeParams<Real>(
-        {lj_radius, lj_wdepth, is_donor, is_hydroxyl, is_polarh, is_acceptor});
+        {lj_radius,
+         lj_sqrt_wdepth,
+         is_donor,
+         is_hydroxyl,
+         is_polarh,
+         is_acceptor});
   }
 
-  LKTypeParams<Real> EIGEN_DEVICE_FUNC lk_params() {
+  LKTypeParams<Real> EIGEN_DEVICE_FUNC lk_params() const {
     return LKTypeParams<Real>(
         {lj_radius,
          lk_dgfree,
@@ -56,7 +70,10 @@ struct LJLKTypeParams {
          is_donor,
          is_hydroxyl,
          is_polarh,
-         is_acceptor});
+         is_acceptor,
+         is_carbon_lk,
+         lk_coeff,
+         lk_inv_lambda2});
   }
 };
 
@@ -82,7 +99,7 @@ struct LJTypeParamTensors {
   auto operator[](Idx i) const {
     return LJTypeParams<Real>{
         lj_radius[i],
-        lj_wdepth[i],
+        std::sqrt(lj_wdepth[i]),
         is_donor[i],
         is_hydroxyl[i],
         is_polarh[i],
@@ -100,6 +117,7 @@ struct LKTypeParamTensors {
   TView<bool, 1, D> is_hydroxyl;
   TView<bool, 1, D> is_polarh;
   TView<bool, 1, D> is_acceptor;
+  TView<bool, 1, D> is_carbon_lk;
 
   template <typename Idx>
   auto operator[](Idx i) const {
@@ -111,7 +129,10 @@ struct LKTypeParamTensors {
         is_donor[i],
         is_hydroxyl[i],
         is_polarh[i],
-        is_acceptor[i]};
+        is_acceptor[i],
+        is_carbon_lk[i],
+        -lk_dgfree[i] / (Real(2) * Real(5.56832799683) * lk_lambda[i]),
+        Real(1) / (lk_lambda[i] * lk_lambda[i])};
   }
 };
 

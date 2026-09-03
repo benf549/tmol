@@ -371,6 +371,11 @@ void TMOL_DEVICE_FUNC elec_load_intrares2_tile_data_to_shared(
     int n_atoms_to_load2,
     ElecScoringData<Real>& intra_dat,
     ElecBlockPairSharedData<Real, TILE_SIZE, MAX_N_CONN>& shared_m) {
+  // A prior same-tile elec_load_intrares_data_from_shared call may have
+  // aliased r2's pointers to the "1" shared-memory arrays. Reset them to
+  // the "2" arrays so the load below writes to the correct destination.
+  intra_dat.r2.coords = shared_m.coords2;
+  intra_dat.r2.charges = shared_m.charges2;
   elec_load_block_coords_and_charges_into_shared<DeviceDispatch, D, nt>(
       coords,
       block_type_partial_charge,
@@ -408,17 +413,12 @@ TMOL_DEVICE_FUNC Real elec_atom_energy(
   Real3 coord1 = coord_from_shared(score_dat.r1.coords, atom_tile_ind1);
   Real3 coord2 = coord_from_shared(score_dat.r2.coords, atom_tile_ind2);
 
+  Real const q1 = score_dat.r1.charges[atom_tile_ind1];
+  Real const q2 = score_dat.r2.charges[atom_tile_ind2];
   Real const dist = distance<Real>::V(coord1, coord2);
-  return elec(
-      dist,
-      score_dat.r1.charges[atom_tile_ind1],
-      score_dat.r2.charges[atom_tile_ind2],
-      Real(cp_separation),
-      score_dat.global_params.D,
-      score_dat.global_params.D0,
-      score_dat.global_params.S,
-      score_dat.global_params.min_dis,
-      score_dat.global_params.max_dis);
+  Real const result =
+      elec(dist, q1, q2, Real(cp_separation), score_dat.global_params);
+  return result;
 }
 
 template <typename Real, tmol::Device D>
@@ -439,18 +439,13 @@ TMOL_DEVICE_FUNC void elec_atom_derivs(
   auto dist_r = distance<Real>::V_dV(coord1, coord2);
   auto& dist = dist_r.V;
   auto& ddist_dat1 = dist_r.dV_dA;
-  auto& ddist_dat2 = dist_r.dV_dB;
   Real V(0.0), dV_ddist(0.0);
   tie(V, dV_ddist) = elec_delec_ddist(
       dist,
       score_dat.r1.charges[atom_tile_ind1],
       score_dat.r2.charges[atom_tile_ind2],
       Real(cp_separation),
-      score_dat.global_params.D,
-      score_dat.global_params.D0,
-      score_dat.global_params.S,
-      score_dat.global_params.min_dis,
-      score_dat.global_params.max_dis);
+      score_dat.global_params);
 
   // all threads accumulate derivatives for atom 1 to global memory
   // Remove "0.5 *" as the energy is no longer split between the i,j and j,i
@@ -467,7 +462,7 @@ TMOL_DEVICE_FUNC void elec_atom_derivs(
   }
 
   // all threads accumulate derivatives for atom 2 to global memory
-  Vec<Real, 3> elec_dxyz_at2 = dTdV * dV_ddist * ddist_dat2;
+  Vec<Real, 3> elec_dxyz_at2 = -elec_dxyz_at1;
   for (int j = 0; j < 3; ++j) {
     if (elec_dxyz_at2[j] != 0) {
       accumulate<D, Real>::add(
@@ -496,18 +491,13 @@ TMOL_DEVICE_FUNC Real elec_atom_energy_and_derivs_full(
   auto dist_r = distance<Real>::V_dV(coord1, coord2);
   auto& dist = dist_r.V;
   auto& ddist_dat1 = dist_r.dV_dA;
-  auto& ddist_dat2 = dist_r.dV_dB;
   Real V(0.0), dV_ddist(0.0);
   tie(V, dV_ddist) = elec_delec_ddist(
       dist,
       score_dat.r1.charges[atom_tile_ind1],
       score_dat.r2.charges[atom_tile_ind2],
       Real(cp_separation),
-      score_dat.global_params.D,
-      score_dat.global_params.D0,
-      score_dat.global_params.S,
-      score_dat.global_params.min_dis,
-      score_dat.global_params.max_dis);
+      score_dat.global_params);
 
   // all threads accumulate derivatives for atom 1 to global memory
   Vec<Real, 3> elec_dxyz_at1 = dV_ddist * ddist_dat1;
@@ -522,7 +512,7 @@ TMOL_DEVICE_FUNC Real elec_atom_energy_and_derivs_full(
   }
 
   // all threads accumulate derivatives for atom 2 to global memory
-  Vec<Real, 3> elec_dxyz_at2 = dV_ddist * ddist_dat2;
+  Vec<Real, 3> elec_dxyz_at2 = -elec_dxyz_at1;
   for (int j = 0; j < 3; ++j) {
     if (elec_dxyz_at2[j] != 0) {
       accumulate<D, Real>::add(

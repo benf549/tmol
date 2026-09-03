@@ -123,7 +123,9 @@ auto DisulfidePoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
     n_V = 1;
   }
   TPack<Real, 4, D> V_t = TPack<Real, 4, D>::zeros({1, n_poses, n_V, n_V});
-  auto dV_dx_t = TPack<Vec<Real, 3>, 2, D>::zeros({1, n_atoms});
+  auto dV_dx_t = compute_derivs
+                     ? TPack<Vec<Real, 3>, 2, D>::zeros({1, n_atoms})
+                     : TPack<Vec<Real, 3>, 2, D>::empty({1, n_atoms});
 
   auto V = V_t.view;
   auto dV_dx = dV_dx_t.view;
@@ -215,8 +217,8 @@ auto DisulfidePoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
     }
   });
 
-  DeviceDispatch<D>::template forall<launch_t>(
-      mgr, n_poses * max_n_blocks, eval_energies);
+  DeviceDispatch<D>::template forall_grouped<launch_t>(
+      mgr, n_poses, max_n_blocks, eval_energies);
 
   return {V_t, dV_dx_t};
 }
@@ -315,6 +317,9 @@ auto DisulfidePoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
           // coincidentally handles the case when block_ind2 == -1
           continue;
         }
+        if (dTdV[0][pose_ind][block_ind1][block_ind2] == 0) {
+          continue;
+        }
         int const block_type2 = first_rot_block_type[pose_ind][block_ind2];
         int const rot_ind2 = first_rot_for_block[pose_ind][block_ind2];
         if (rot_ind2 < 0) {
@@ -369,8 +374,8 @@ auto DisulfidePoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
     }
   });
 
-  DeviceDispatch<D>::template forall<launch_t>(
-      mgr, n_poses * max_n_blocks, eval_derivs);
+  DeviceDispatch<D>::template forall_grouped<launch_t>(
+      mgr, n_poses, max_n_blocks, eval_derivs);
 
   return dV_dcoords_t;
 }

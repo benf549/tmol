@@ -1,11 +1,11 @@
 # import torch
 #
-# from tmol.pack.rotamer.build_rotamers import build_rotamers
+# from tmol.pack.rotamer import build_rotamers
 # from tmol.pack.rotamer.bounding_spheres import create_rotamer_bounding_spheres
 #
-# from tmol.pose.pose_stack_builder import PoseStackBuilder
-# from tmol.pack.packer_task import PackerTask, PackerPalette
-# from tmol.pack.rotamer.fixed_aa_chi_sampler import FixedAAChiSampler
+# from tmol.pose import PoseStackBuilder
+# from tmol.pack import PackerTask, PackerPalette
+# from tmol.pack.rotamer import FixedAAChiSampler
 #
 # from tmol.tests.data import no_termini_pose_stack_from_pdb
 #
@@ -27,7 +27,7 @@
 #     assert p1.packed_block_types is p3.packed_block_types
 #
 #     poses = PoseStackBuilder.from_poses([p1, p2, p3], torch_device)
-#     palette = PackerPalette(poses.packed_block_types.restype_set)
+#     palette = PackerPalette()
 #     task = PackerTask(poses, palette)
 #     task.restrict_to_repacking()
 #     task.rlts[0][1].disable_packing()
@@ -86,7 +86,7 @@
 #     )
 #     poses = PoseStackBuilder.from_poses([p] * n_poses, torch_device)
 #
-#     palette = PackerPalette(poses.packed_block_types.restype_set)
+#     palette = PackerPalette()
 #     task = PackerTask(poses, palette)
 #     task.restrict_to_repacking()
 #
