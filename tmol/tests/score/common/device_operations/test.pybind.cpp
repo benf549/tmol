@@ -9,12 +9,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using CPU = DevOpsTests<Device::CPU>;
 
   m.def("test_forall", &CPU::test_forall, "src"_a);
-  m.def("test_forall_stacks", &CPU::test_forall_stacks, "src"_a);
+  m.def("test_forall_independent", &CPU::test_forall_independent, "src"_a);
+  m.def("test_forall_grouped", &CPU::test_forall_grouped, "src"_a);
   m.def(
       "test_foreach_combination_triple",
       &CPU::test_foreach_combination_triple,
       "src"_a);
   m.def("test_foreach_workgroup", &CPU::test_foreach_workgroup, "src"_a);
+  m.def(
+      "test_foreach_independent_workgroup",
+      &CPU::test_foreach_independent_workgroup,
+      "src"_a);
+  m.def(
+      "test_foreach_pose_workgroup",
+      &CPU::test_foreach_pose_workgroup,
+      "src"_a);
   m.def("test_scan_inclusive", &CPU::test_scan_inclusive, "src"_a);
   m.def("test_scan_exclusive", &CPU::test_scan_exclusive, "src"_a);
   m.def(
@@ -48,12 +57,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // All functions take TView arguments; pybind resolves CPU vs CUDA overloads
   // by inspecting the device of the input tensors.
   m.def("test_forall", &CUDA::test_forall, "src"_a);
-  m.def("test_forall_stacks", &CUDA::test_forall_stacks, "src"_a);
+  m.def("test_forall_independent", &CUDA::test_forall_independent, "src"_a);
+  m.def("test_forall_grouped", &CUDA::test_forall_grouped, "src"_a);
   m.def(
       "test_foreach_combination_triple",
       &CUDA::test_foreach_combination_triple,
       "src"_a);
   m.def("test_foreach_workgroup", &CUDA::test_foreach_workgroup, "src"_a);
+  m.def(
+      "test_foreach_independent_workgroup",
+      &CUDA::test_foreach_independent_workgroup,
+      "src"_a);
+  m.def(
+      "test_foreach_pose_workgroup",
+      &CUDA::test_foreach_pose_workgroup,
+      "src"_a);
   m.def("test_scan_inclusive", &CUDA::test_scan_inclusive, "src"_a);
   m.def("test_scan_exclusive", &CUDA::test_scan_exclusive, "src"_a);
   m.def(

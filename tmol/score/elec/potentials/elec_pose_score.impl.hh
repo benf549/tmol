@@ -503,9 +503,11 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
   assert(block_type_intra_repr_path_distance.size(1) == max_n_block_atoms);
   assert(block_type_intra_repr_path_distance.size(2) == max_n_block_atoms);
 
-  auto dV_dcoords_t = compute_derivs
+  // Block-pair autograd recomputes coordinate derivatives in backward.
+  bool const accumulate_derivs = compute_derivs && !output_block_pair_energies;
+  auto dV_dcoords_t = accumulate_derivs
                           ? TPack<Vec<Real, 3>, 2, D>::zeros({1, n_atoms})
-                          : TPack<Vec<Real, 3>, 2, D>::empty({1, n_atoms});
+                          : TPack<Vec<Real, 3>, 2, D>::empty({1, 0});
   auto dV_dcoords = dV_dcoords_t.view;
 
   auto scratch_rot_spheres_t =
@@ -842,11 +844,11 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
 
   // 3
   if (output_block_pair_energies || !compute_derivs) {
-    DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-        mgr, n_poses * max_n_upper_triangle_inds, eval_energies_by_block);
+    DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
+        mgr, n_poses, max_n_upper_triangle_inds, eval_energies_by_block);
   } else {
-    DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-        mgr, n_poses * max_n_upper_triangle_inds, eval_energies);
+    DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
+        mgr, n_poses, max_n_upper_triangle_inds, eval_energies);
   }
 
   return {output_t, dV_dcoords_t, scratch_rot_neighbors_t};
@@ -1041,6 +1043,10 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
       return;
     }
 
+    if (dTdV[0][pose_ind][block_ind1][block_ind2] == 0) {
+      return;
+    }
+
     int const block_type1 = block_type_ind_for_rot[rot_ind1];
     int const block_type2 = block_type_ind_for_rot[rot_ind2];
 
@@ -1115,8 +1121,8 @@ auto ElecPoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
 
   // Since we have the sphere overlap results from the forward pass,
   // there's only a single kernel launch here
-  DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-      mgr, n_poses * max_n_upper_triangle_inds, eval_derivs);
+  DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
+      mgr, n_poses, max_n_upper_triangle_inds, eval_derivs);
 
   return dV_dcoords_t;
 }
@@ -1426,8 +1432,13 @@ auto ElecRotamerScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
   // mgpu::standard_context_t context(wrapped_stream.stream());
 
   // 2
-  DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-      mgr, dispatch_indices.size(1), eval_energies_by_block);
+  if (compute_derivs) {
+    DeviceDispatch<D>::template foreach_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies_by_block);
+  } else {
+    DeviceDispatch<D>::template foreach_independent_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies_by_block);
+  }
 
   return {output_t, dV_dcoords_t, dispatch_indices_t};
 }  // namespace potentials

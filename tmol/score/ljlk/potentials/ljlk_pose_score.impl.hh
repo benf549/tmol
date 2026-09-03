@@ -813,9 +813,12 @@ auto LJLKPoseScoreDispatch<DeviceOperations, D, Real, Int>::forward(
   assert(block_type_path_distance.size(1) == max_n_block_atoms);
   assert(block_type_path_distance.size(2) == max_n_block_atoms);
 
-  auto dV_dcoords_t = require_gradient
+  // Block-pair autograd recomputes coordinate derivatives in backward.
+  bool const accumulate_derivs =
+      require_gradient && !output_block_pair_energies;
+  auto dV_dcoords_t = accumulate_derivs
                           ? TPack<Vec<Real, 3>, 2, D>::zeros({3, n_atoms})
-                          : TPack<Vec<Real, 3>, 2, D>::empty({3, n_atoms});
+                          : TPack<Vec<Real, 3>, 2, D>::empty({3, 0});
   auto dV_dcoords = dV_dcoords_t.view;
 
   auto scratch_rot_spheres_t =
@@ -1153,22 +1156,24 @@ auto LJLKPoseScoreDispatch<DeviceOperations, D, Real, Int>::forward(
           max_dis);
 
   if (output_block_pair_energies) {
-    DeviceOperations<D>::template foreach_workgroup<launch_t>(
-        mgr, n_poses * max_n_upper_triangle_inds, eval_energies_by_block);
+    DeviceOperations<D>::template foreach_pose_workgroup<launch_t>(
+        mgr, n_poses, max_n_upper_triangle_inds, eval_energies_by_block);
   } else {
     int const n_workgroups = n_poses * max_n_upper_triangle_inds;
     if (!require_gradient && n_workgroups >= min_high_occupancy_workgroups) {
-      DeviceOperations<D>::template foreach_workgroup<launch_t_high_occupancy>(
-          mgr, n_workgroups, eval_energies_by_block);
+      DeviceOperations<D>::template foreach_pose_workgroup<
+          launch_t_high_occupancy>(
+          mgr, n_poses, max_n_upper_triangle_inds, eval_energies_by_block);
     } else if (!require_gradient) {
-      DeviceOperations<D>::template foreach_workgroup<launch_t>(
-          mgr, n_workgroups, eval_energies_by_block);
+      DeviceOperations<D>::template foreach_pose_workgroup<launch_t>(
+          mgr, n_poses, max_n_upper_triangle_inds, eval_energies_by_block);
     } else if (n_workgroups >= min_high_occupancy_workgroups) {
-      DeviceOperations<D>::template foreach_workgroup<launch_t_high_occupancy>(
-          mgr, n_workgroups, eval_energies);
+      DeviceOperations<D>::template foreach_pose_workgroup<
+          launch_t_high_occupancy>(
+          mgr, n_poses, max_n_upper_triangle_inds, eval_energies);
     } else {
-      DeviceOperations<D>::template foreach_workgroup<launch_t>(
-          mgr, n_workgroups, eval_energies);
+      DeviceOperations<D>::template foreach_pose_workgroup<launch_t>(
+          mgr, n_poses, max_n_upper_triangle_inds, eval_energies);
     }
   }
 
@@ -1403,6 +1408,12 @@ auto LJLKPoseScoreDispatch<DeviceOperations, D, Real, Int>::backward(
       return;
     }
 
+    if (dTdV[0][pose_ind][block_ind1][block_ind2] == 0
+        && dTdV[1][pose_ind][block_ind1][block_ind2] == 0
+        && dTdV[2][pose_ind][block_ind1][block_ind2] == 0) {
+      return;
+    }
+
     int const block_type1 = block_type_ind_for_rot[rot_ind1];
     int const block_type2 = block_type_ind_for_rot[rot_ind2];
 
@@ -1485,8 +1496,8 @@ auto LJLKPoseScoreDispatch<DeviceOperations, D, Real, Int>::backward(
   // 3: launch a kernel to evaluate lj/lk between pairs of blocks
   // within striking distance
 
-  DeviceOperations<D>::template foreach_workgroup<launch_t>(
-      mgr, n_poses * max_n_upper_triangle_inds, eval_derivs);
+  DeviceOperations<D>::template foreach_pose_workgroup<launch_t>(
+      mgr, n_poses, max_n_upper_triangle_inds, eval_derivs);
 
   return dV_dcoords_t;
 }
@@ -1801,8 +1812,13 @@ auto LJLKRotamerScoreDispatch<DeviceOperations, D, Real, Int>::forward(
   // within striking distance
 
   assert(output_block_pair_energies);
-  DeviceOperations<D>::template foreach_workgroup<launch_t>(
-      mgr, dispatch_indices.size(1), eval_energies_by_block);
+  if (require_gradient) {
+    DeviceOperations<D>::template foreach_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies_by_block);
+  } else {
+    DeviceOperations<D>::template foreach_independent_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies_by_block);
+  }
 
   return {output_t, dV_dcoords_t, dispatch_indices_t};
 }  // LJLKRotamerScoreDispatch::forward

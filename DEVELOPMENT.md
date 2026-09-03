@@ -20,7 +20,7 @@ git clone https://github.com/uw-ipd/tmol.git && cd tmol
 pip install -e ".[dev]"   # builds C++/CUDA extensions via CMake
 ```
 
-Requirements: Python 3.11+, PyTorch 2.8+, C++17 compiler, CMake 3.18+. CUDA toolkit (`nvcc`) is optional — without it, only CPU extensions are built. Pre-built wheels are published for Python `cp311`-`cp314`.
+Requirements: Python 3.11+, PyTorch 2.8+, C++17 compiler, CMake 3.24+. CUDA toolkit (`nvcc`) is optional — without it, only CPU extensions are built. Pre-built wheels are published for Python `cp311`-`cp314`.
 
 ## Building Extensions
 
@@ -33,8 +33,11 @@ pip install -e .
 # Build with test extensions
 pip install -e . -Ccmake.define.TMOL_BUILD_TESTS=ON
 
-# Target specific GPU architectures (default: "80;86;89;90")
+# Target specific GPU architectures (default: "native")
 pip install -e . -Ccmake.define.CMAKE_CUDA_ARCHITECTURES="80;90"
+
+# Build every sm_75+ target supported by nvcc (used for CUDA 13 release wheels)
+pip install -e . -Ccmake.define.CMAKE_CUDA_ARCHITECTURES=all
 
 # Control parallelism
 MAX_JOBS=4 pip install -e . -Ccmake.define.TMOL_NVCC_THREADS=2
@@ -44,7 +47,7 @@ CMake build options:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CMAKE_CUDA_ARCHITECTURES` | `80;86;89;90` | GPU compute capabilities to compile for |
+| `CMAKE_CUDA_ARCHITECTURES` | `native` | `native` compiles for GPUs visible at build time. `all` emits SASS for every sm_75+ target reported by `nvcc --list-gpu-code`, plus PTX for the newest target. |
 | `TMOL_BUILD_TESTS` | `OFF` | Build test-only C++/CUDA extensions |
 | `TMOL_NVCC_THREADS` | `4` | Threads per nvcc invocation |
 | `TMOL_ENABLE_CUDA` | `ON` | Set to `OFF` for CPU-only build (no `nvcc` needed) |
@@ -218,13 +221,12 @@ tail -f /net/scratch/kdidi/actions-runner/runner.log
 ## Releasing
 
 The version in a development checkout is not proof that a release has been
-published. As of 2026-07-17, GitHub Releases and PyPI contain v0.1.40; v0.1.42
-is the next validated release candidate. Check the GitHub Releases page before
-using a versioned wheel URL.
+published. Check both GitHub Releases and PyPI before choosing the next version
+or using a versioned wheel URL; published versions and artifacts are immutable.
 
 1. Bump `project.version` in `pyproject.toml`.
 2. Commit the version bump and ensure both `CI` and `Wheel smoke test` pass.
-3. Create and push the matching version tag (for example `v0.1.42`):
+3. Create and push the matching version tag (for example `vX.Y.Z`):
    - `publish.yml` triggers only from a pushed `v*` tag.
    - The workflow rejects tags that do not match `project.version`.
 4. Wait for workflow completion:
@@ -235,7 +237,7 @@ using a versioned wheel URL.
    - `upload`
 5. Verify release artifacts:
    - PyPI sdist upload succeeds.
-   - GitHub prerelease `vX.Y.Z` exists and contains exactly 32 manylinux wheel files: 24 GPU and 8 CPU.
+   - GitHub prerelease `vX.Y.Z` exists and contains exactly 33 manylinux wheel files: 25 GPU and 8 CPU.
 6. Install using explicit wheel files (recommended):
    - Install matching PyTorch/CUDA first.
    - Install from GitHub release wheel URL (or pinned `tmol==X.Y.Z+...` with `--find-links`).
@@ -269,4 +271,3 @@ Pre-commit runs `clang-format` (C++) and `black` (Python) on staged files. If fo
 ### Pull requests
 
 All changes to master go through pull requests. PRs are merged via squash or rebase to keep a linear history. Each PR should be an atomic unit of work.
-

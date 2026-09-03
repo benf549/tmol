@@ -25,6 +25,8 @@ from tmol.pack.rotamer import ChiSampler
 
 @attr.s(auto_attribs=True, frozen=True)
 class FixedAAChiSampler(ChiSampler):
+    """Generate one ideal side-chain conformer for fixed amino acids."""
+
     @classmethod
     def sampler_name(cls):
         return "FixedAAChiSampler"
@@ -53,7 +55,7 @@ class FixedAAChiSampler(ChiSampler):
     def first_sc_atoms_for_rt(self, rt: RefinedResidueType) -> Tuple[str, ...]:
         if rt.base_name == "GLY":
             return ("HA3",)
-        elif rt.base_name == "ALA":
+        if rt.base_name == "ALA":
             return ("CB",)
 
     def annotate_residue_type(self, block_type):
@@ -103,12 +105,9 @@ class FixedAAChiSampler(ChiSampler):
             is_bt_faas_allowed_and_built_by, cons_bt_is_allowed
         ).to(torch.int32)
 
-        n_fixed_rots = torch.sum(n_rots_for_gbt).item()
-        gbt_for_rotamer = torch.nonzero(n_rots_for_gbt > 0, as_tuple=True)[0].to(
-            torch.int32
-        )
+        gbt_for_rotamer = n_rots_for_gbt.nonzero(as_tuple=True)[0].to(torch.int32)
         chi_for_rotamers = torch.zeros(
-            (n_fixed_rots, 1), dtype=torch.float32, device=poses.device
+            (gbt_for_rotamer.shape[0], 1), dtype=torch.float32, device=poses.device
         )
         chi_defining_atom_for_rotamer = torch.full_like(
             chi_for_rotamers, -1, dtype=torch.int32

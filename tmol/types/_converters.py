@@ -12,6 +12,7 @@ _converters = []
 
 @singledispatch
 def get_converter(type_annotation):
+    """Return the registered value converter for a type annotation."""
     for pred, conv in _converters:
         if pred(type_annotation):
             return conv(type_annotation)
@@ -21,14 +22,15 @@ def get_converter(type_annotation):
 
 @toolz.curry
 def constructor_convert(type_annotation, value):
+    """Convert a value by calling the annotated type when necessary."""
     if isinstance(value, type_annotation):
         return value
-    else:
-        return type_annotation(value)
+    return type_annotation(value)
 
 
 @toolz.curry
 def validate_convert(type_annotation, value):
+    """Validate a value against an annotation and return it unchanged."""
     validators.get_validator(type_annotation)(value)
 
     return value
@@ -36,6 +38,7 @@ def validate_convert(type_annotation, value):
 
 @toolz.curry
 def union_convert(union_annotation, value):
+    """Convert a value using the first compatible member of a union."""
     for subtype in union_annotation.__args__:
         try:
             validators.get_validator(subtype)(value)
@@ -46,17 +49,17 @@ def union_convert(union_annotation, value):
     errors = []
     for subtype in union_annotation.__args__:
         try:
-            result = get_converter(subtype)(value)
-            return result
+            return get_converter(subtype)(value)
         except (TypeError, ValueError) as ex:
             errors.append(ex)
 
     raise TypeError(
-        "Unable to convert to any union subtype: {union_annotaion} value: {value}"
+        f"Unable to convert to any union subtype: {union_annotation} value: {value!r}"
     )
 
 
 def register_converter(type_predicate, converter):
+    """Register a converter factory for annotations matching a predicate."""
     _converters.append((type_predicate, converter))
 
 

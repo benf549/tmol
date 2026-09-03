@@ -1,3 +1,5 @@
+"""Structure conversion between external formats and TMol poses."""
+
 import torch
 from typing import Optional, Union
 
@@ -55,6 +57,7 @@ from ._pose_stack_from_atomworks import (  # noqa: F401
     ATOMWORKS_NAME3S,
     ATOMWORKS_ATOM37_NAMES,
     pose_stack_from_atomworks,
+    pose_stack_from_atom37_and_biotite,
     canonical_form_from_atomworks,
     atomworks_from_pose_stack,
     canonical_ordering_for_atomworks,
@@ -65,6 +68,7 @@ from ._pose_stack_from_atomworks import (  # noqa: F401
 )
 from tmol.chemical import get_element_from_atom_name  # noqa: F401
 from ._pose_stack_from_biotite import (  # noqa: F401
+    Atom37MappingError,
     build_context_from_biotite,
     pose_stack_from_biotite,
     biotite_from_pose_stack,
@@ -94,6 +98,7 @@ from ._write_pose_stack_pdb import (  # noqa: F401
 )
 
 __all__ = [
+    "Atom37MappingError",
     "CanonicalForm",
     "CanonicalOrdering",
     "PoseBuildContext",
@@ -121,6 +126,7 @@ __all__ = [
     "packed_block_types_for_openfold",
     "packed_block_types_for_rosettafold2",
     "pose_stack_from_atomworks",
+    "pose_stack_from_atom37_and_biotite",
     "pose_stack_from_biotite",
     "pose_stack_from_openfold",
     "pose_stack_from_pdb",

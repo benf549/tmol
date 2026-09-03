@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 from pathlib import Path
 
 import nbformat
@@ -20,9 +21,15 @@ TUTORIAL_NOTEBOOKS = (
     "06_fast_relax.ipynb",
     "07_ligand_and_params.ipynb",
     "08_nucleic_acids.ipynb",
+    "09_protein_interface_hotspot_scan.ipynb",
+    "10_ligand_pose_sensitivity.ipynb",
 )
 TUTORIAL_REF = "master"
 KERNEL_STARTUP_TIMEOUT = 180
+CPU_CUDA_RUNTIME_NOISE = re.compile(
+    r"^W\d{4} .* torch/utils/cpp_extension\.py:\d+\] "
+    r"No CUDA runtime is found, using CUDA_HOME='[^']*'\n?$"
+)
 
 
 def _validate_tutorial_entrypoints(notebook, path: Path) -> None:
@@ -43,24 +50,49 @@ def _validate_tutorial_entrypoints(notebook, path: Path) -> None:
         raise ValueError(f"{path} does not use the current tutorial bootstrap")
 
 
+def _is_gpu_only_cell(cell) -> bool:
+    """Return whether a notebook cell is explicitly marked as GPU-only."""
+    if cell.cell_type != "code":
+        return False
+    tags = cell.get("metadata", {}).get("tags", [])
+    has_source_tag = any(
+        line.strip() == "#| tags: [gpu-only]" for line in cell.source.splitlines()[:3]
+    )
+    return "gpu-only" in tags or has_source_tag
+
+
 def _without_gpu_cells(notebook):
     """Copy a notebook and replace ``gpu-only`` cells with a CPU skip."""
     notebook = copy.deepcopy(notebook)
     for cell in notebook.cells:
-        if cell.cell_type != "code":
-            continue
-        tags = cell.get("metadata", {}).get("tags", [])
-        has_source_tag = any(
-            line.strip() == "#| tags: [gpu-only]"
-            for line in cell.source.splitlines()[:3]
-        )
-        if "gpu-only" in tags or has_source_tag:
+        if _is_gpu_only_cell(cell):
             cell.source = (
                 "print('Skipped by CPU smoke execution: this cell requires CUDA.')"
             )
             cell.outputs = []
             cell.execution_count = None
     return notebook
+
+
+def _remove_expected_cpu_cuda_noise(notebook) -> None:
+    """Remove PyTorch's expected no-CUDA warning from published CPU outputs."""
+    for cell in notebook.cells:
+        if cell.cell_type != "code":
+            continue
+        retained = []
+        for output in cell.outputs:
+            if output.output_type != "stream":
+                retained.append(output)
+                continue
+            text = "".join(
+                line
+                for line in output.text.splitlines(keepends=True)
+                if not CPU_CUDA_RUNTIME_NOISE.fullmatch(line)
+            )
+            if text:
+                output.text = text
+                retained.append(output)
+        cell.outputs = retained
 
 
 def execute_notebook(
@@ -85,11 +117,15 @@ def execute_notebook(
         resources={"metadata": {"path": str(path.parent.resolve())}},
     )
     client.execute()
+    if not include_gpu_cells:
+        _remove_expected_cpu_cuda_noise(executed)
     if write:
         # Preserve the authored source (including GPU examples), but copy the
         # CPU execution results used by nbsphinx into the CI workspace.
         for source_cell, executed_cell in zip(notebook.cells, executed.cells):
             if source_cell.cell_type != "code":
+                continue
+            if not include_gpu_cells and _is_gpu_only_cell(source_cell):
                 continue
             source_cell.outputs = executed_cell.outputs
             source_cell.execution_count = executed_cell.execution_count
@@ -103,7 +139,7 @@ def main() -> int:
         "notebooks",
         nargs="*",
         type=Path,
-        help="Notebook paths (defaults to the eight published tutorials when present)",
+        help="Notebook paths (defaults to the ten published tutorials when present)",
     )
     parser.add_argument(
         "--timeout",

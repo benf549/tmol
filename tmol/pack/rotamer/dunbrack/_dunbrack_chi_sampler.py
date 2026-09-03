@@ -64,6 +64,8 @@ class DunSamplerPBTCache:
 # ParamResolver.
 # @attr.s(auto_attribs=True, slots=True, frozen=True)
 class DunbrackChiSampler(ChiSampler):
+    """Sample amino-acid side-chain conformers from Dunbrack libraries."""
+
     dun_param_resolver: DunbrackParamResolver
 
     def __eq__(self, other):
@@ -745,7 +747,8 @@ def create_dunbrack_sampler_from_database(
 
     Args:
         param_db: The parameter database containing Dunbrack parameters
-        device: The device to use for the sampler
+        device: The device to use for the sampler. An unindexed CUDA device
+            resolves to the current CUDA device.
 
     Returns:
         DunbrackChiSampler: Configured sampler for rotamer building

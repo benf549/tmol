@@ -9,6 +9,8 @@ from tmol.types import (
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)
 class RotamerSet(ValidateAttrs):
+    """Packed coordinates and pose/block indexing for generated rotamers."""
+
     n_rots_for_pose: Tensor[torch.int64][:]
     rot_offset_for_pose: Tensor[torch.int64][:]
     n_rots_for_block: Tensor[torch.int64][:, :]
@@ -48,8 +50,7 @@ class RotamerSet(ValidateAttrs):
         pifa = torch.zeros((n_atoms,), dtype=torch.int64, device=self.coords.device)
         # mark the first atom for the first rotamer in each pose after pose 0
         pifa[self.coord_offset_for_rot[self.rot_offset_for_pose[1:]]] = 1
-        pifa = torch.cumsum(pifa, dim=0)
-        return pifa
+        return torch.cumsum(pifa, dim=0)
 
     @property
     def n_rotamers_total(self):

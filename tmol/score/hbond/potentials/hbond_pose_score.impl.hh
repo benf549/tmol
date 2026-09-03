@@ -77,7 +77,7 @@ EIGEN_DEVICE_FUNC int interres_count_pair_separation(
     if (cp_separation < 5) {                                   \
       return Real(0.0);                                        \
     }                                                          \
-    if (compute_derivs) {                                      \
+    if (accumulate_derivs) {                                   \
       Real val = hbond_atom_energy_and_derivs_full<TILE_SIZE>( \
           don_ind,                                             \
           acc_ind,                                             \
@@ -585,9 +585,11 @@ auto HBondPoseScoreDispatch<DeviceDispatch, Dev, Real, Int>::forward(
 
   assert(max_n_interblock_bonds <= MAX_N_CONN);
 
-  auto dV_dcoords_t = compute_derivs
+  // Block-pair autograd recomputes coordinate derivatives in backward.
+  bool const accumulate_derivs = compute_derivs && !output_block_pair_energies;
+  auto dV_dcoords_t = accumulate_derivs
                           ? TPack<Vec<Real, 3>, 2, Dev>::zeros({1, n_atoms})
-                          : TPack<Vec<Real, 3>, 2, Dev>::empty({1, n_atoms});
+                          : TPack<Vec<Real, 3>, 2, Dev>::empty({1, 0});
   auto dV_dcoords = dV_dcoords_t.view;
 
   auto scratch_rot_spheres_t =
@@ -781,8 +783,8 @@ auto HBondPoseScoreDispatch<DeviceDispatch, Dev, Real, Int>::forward(
           scratch_rot_neighbors,
           Real(5.5));
 
-  DeviceDispatch<Dev>::template foreach_workgroup<launch_t>(
-      mgr, n_poses * max_n_upper_triangle_inds, eval_energies);
+  DeviceDispatch<Dev>::template foreach_pose_workgroup<launch_t>(
+      mgr, n_poses, max_n_upper_triangle_inds, eval_energies);
 
   // DeviceDispatch<Dev>::synchronize_device();
   return {output_t, dV_dcoords_t, scratch_rot_neighbors_t};
@@ -926,6 +928,10 @@ auto HBondPoseScoreDispatch<DeviceDispatch, Dev, Real, Int>::backward(
       return;
     }
 
+    if (dTdV[0][pose_ind][block_ind1][block_ind2] == 0) {
+      return;
+    }
+
     int const block_type1 = block_type_ind_for_rot[rot_ind1];
     int const block_type2 = block_type_ind_for_rot[rot_ind2];
 
@@ -1044,8 +1050,8 @@ auto HBondPoseScoreDispatch<DeviceDispatch, Dev, Real, Int>::backward(
         store_calculated_energies);
   });
 
-  DeviceDispatch<Dev>::template foreach_workgroup<launch_t>(
-      mgr, n_poses * max_n_upper_triangle_inds, eval_derivs);
+  DeviceDispatch<Dev>::template foreach_pose_workgroup<launch_t>(
+      mgr, n_poses, max_n_upper_triangle_inds, eval_derivs);
 
   return dV_dcoords_t;
 }
@@ -1223,6 +1229,7 @@ auto HBondRotamerScoreDispatch<DeviceDispatch, Dev, Real, Int>::forward(
 
   assert(max_n_interblock_bonds <= MAX_N_CONN);
 
+  bool const accumulate_derivs = compute_derivs;
   auto dV_dcoords_t = TPack<Vec<Real, 3>, 2, Dev>::zeros({1, n_atoms});
   auto dV_dcoords = dV_dcoords_t.view;
 
@@ -1398,8 +1405,13 @@ auto HBondRotamerScoreDispatch<DeviceDispatch, Dev, Real, Int>::forward(
   // at::cuda::getDefaultCUDAStream(); mgpu::standard_context_t
   // context(wrapped_stream.stream());
 
-  DeviceDispatch<Dev>::template foreach_workgroup<launch_t>(
-      mgr, dispatch_indices.size(1), eval_energies);
+  if (compute_derivs) {
+    DeviceDispatch<Dev>::template foreach_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies);
+  } else {
+    DeviceDispatch<Dev>::template foreach_independent_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_energies);
+  }
 
   // DeviceDispatch<Dev>::synchronize_device();
   return {output_t, dV_dcoords_t, dispatch_indices_t};

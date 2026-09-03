@@ -249,9 +249,11 @@ auto CartBondedPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
   // Allocate the tensors to which we will write our outputs
   int const n_V = output_block_pair_energies ? max_n_blocks : 1;
   auto V_t = TPack<Real, 4, D>::zeros({5, n_poses, n_V, n_V});
-  auto dV_dx_t = compute_derivs
+  // Block-pair autograd recomputes coordinate derivatives in backward.
+  bool const accumulate_derivs = compute_derivs && !output_block_pair_energies;
+  auto dV_dx_t = accumulate_derivs
                      ? TPack<Vec<Real, 3>, 2, D>::zeros({5, n_atoms})
-                     : TPack<Vec<Real, 3>, 2, D>::empty({5, n_atoms});
+                     : TPack<Vec<Real, 3>, 2, D>::empty({5, 0});
 
   auto V = V_t.view;
   auto dV_dx = dV_dx_t.view;
@@ -300,7 +302,7 @@ auto CartBondedPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
       // Real score;
       switch (type) {
         case subgraph_type::length: {
-          if (compute_derivs) {
+          if (accumulate_derivs) {
             auto eval = cblength_V_dV(atom1, atom2, params[2], params[1]);
             accumulate_result<Real, Int, 2, D>(
                 length_score,
@@ -317,7 +319,7 @@ auto CartBondedPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
         }
         case subgraph_type::angle: {
           Vec<Real, 3> atom3 = rot_coords[atoms[2]];
-          if (compute_derivs) {
+          if (accumulate_derivs) {
             auto eval = cbangle_V_dV(atom1, atom2, atom3, params[2], params[1]);
             accumulate_result<Real, Int, 3, D>(
                 angle_score, eval, atoms.head(3), true, dV_dx[score_type], 1.0);
@@ -333,7 +335,7 @@ auto CartBondedPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
           Real& tor_score = (score_type == 3)   ? improper_torsion_score
                             : (score_type == 4) ? hxyl_torsion_score
                                                 : torsion_score;
-          if (compute_derivs) {
+          if (accumulate_derivs) {
             auto eval = cbtorsion_V_dV(
                 atom1,
                 atom2,
@@ -606,9 +608,10 @@ auto CartBondedPoseScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
     });
     DeviceDispatch<D>::template for_each_in_workgroup<nt>(reduce_energies);
   });
-  DeviceDispatch<D>::template foreach_workgroup<launch_t>(
+  DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
       mgr,
-      n_poses * max_n_blocks * (max_n_conns + 1),
+      n_poses,
+      max_n_blocks * (max_n_conns + 1),
       eval_subgraphs_for_interaction);
 
   return {V_t, dV_dx_t};
@@ -740,13 +743,16 @@ auto CartBondedPoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
       Real hxyl_torsion_score = 0.0;
       Vec<Real, 7> params = hash_values[param_index];
 
-      Vec<Real, 3> atom1 = rot_coords[atoms[0]];
-      Vec<Real, 3> atom2 = rot_coords[atoms[1]];
-
       subgraph_type type = get_subgraph_type(atoms);
 
       int score_type = params[0];
       Real block_weight = dTdV[score_type][pose_ind][block_ind1][block_ind2];
+      if (block_weight == 0) {
+        return;
+      }
+
+      Vec<Real, 3> atom1 = rot_coords[atoms[0]];
+      Vec<Real, 3> atom2 = rot_coords[atoms[1]];
 
       // Real score;
       switch (type) {
@@ -983,9 +989,10 @@ auto CartBondedPoseScoreDispatch<DeviceDispatch, D, Real, Int>::backward(
     // we are only computing derivatives in this pass and don't need the score
     // a second time
   });
-  DeviceDispatch<D>::template foreach_workgroup<launch_t>(
+  DeviceDispatch<D>::template foreach_pose_workgroup<launch_t>(
       mgr,
-      n_poses * max_n_blocks * (max_n_conns + 1),
+      n_poses,
+      max_n_blocks * (max_n_conns + 1),
       eval_subgraphs_for_interaction);
 
   return dV_dx_t;
@@ -1526,8 +1533,13 @@ auto CartBondedRotamerScoreDispatch<DeviceDispatch, D, Real, Int>::forward(
     });
     DeviceDispatch<D>::template for_each_in_workgroup<nt>(reduce_energies);
   });
-  DeviceDispatch<D>::template foreach_workgroup<launch_t>(
-      mgr, dispatch_indices.size(1), eval_subgraphs_for_interaction);
+  if (compute_derivs) {
+    DeviceDispatch<D>::template foreach_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_subgraphs_for_interaction);
+  } else {
+    DeviceDispatch<D>::template foreach_independent_workgroup<launch_t>(
+        mgr, dispatch_indices.size(1), eval_subgraphs_for_interaction);
+  }
 
   return {
       V_t,

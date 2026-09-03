@@ -16,6 +16,7 @@ from tmol.pack.rotamer import (
     merge_conformer_samples,
     calculate_rotamer_coords,
     get_rotamer_origin_data,
+    load_rotamer_parents,
     create_dof_inds_to_copy_from_orig_to_rotamers_for_sampler,
     FixedAAChiSampler,
 )
@@ -64,6 +65,16 @@ def test_chi_atom_table_orders_double_digit_chis_numerically():
     )
 
 
+def test_load_rotamer_parents_accepts_empty_conformer():
+    parents = numpy.zeros((1, 1), dtype=numpy.int32)
+    n_atoms = numpy.zeros(1, dtype=numpy.int32)
+    offsets = numpy.zeros(1, dtype=numpy.int64)
+
+    compact = load_rotamer_parents(parents, 0, n_atoms, offsets)
+
+    numpy.testing.assert_array_equal(compact, numpy.zeros(1, dtype=numpy.int32))
+
+
 def test_annotate_restypes(
     default_database, fresh_default_restype_set, torch_device, dun_sampler
 ):
@@ -103,7 +114,13 @@ def test_build_rotamers_smoke(default_database, ubq_pdb, torch_device, dun_sampl
     task = SetPackerTask.from_packer_task(task)
 
     poses, rotamer_set = build_rotamers(poses, task, default_database.chemical)
-    assert rotamer_set is not None
+    _, cached_rotamer_set = build_rotamers(poses, task, default_database.chemical)
+
+    torch.testing.assert_close(cached_rotamer_set.coords, rotamer_set.coords)
+    torch.testing.assert_close(
+        cached_rotamer_set.block_type_ind_for_rot,
+        rotamer_set.block_type_ind_for_rot,
+    )
 
 
 def test_construct_scans_for_rotamers(
@@ -314,12 +331,10 @@ def test_measure_pose_dofs(default_database, ubq_pdb, torch_device, dun_sampler)
         n_atoms_offset_for_conformer,
     )
 
-    n_conformers = poses.max_n_blocks
     n_atoms_total = poses.max_n_pose_atoms
 
     rotamer_coords = calculate_rotamer_coords(
         pbt,
-        n_conformers,
         n_atoms_total,
         orig_kinforest,
         nodes,
@@ -1460,8 +1475,6 @@ def test_new_rotamer_building_logic1(
 
     gbt_for_conformer_torch = _t(gbt_for_conformer, torch.int64)
 
-    n_conformers = sampler_for_conformer.shape[0]
-
     block_type_ind_for_conformer = gbt_block_type_ind[gbt_for_conformer_np]
     block_type_ind_for_conformer_torch = _t(block_type_ind_for_conformer, torch.int64)
 
@@ -1525,7 +1538,6 @@ def test_new_rotamer_building_logic1(
 
     rotamer_coords = calculate_rotamer_coords(
         pbt,
-        n_conformers,
         n_atoms_total,
         conformer_kinforest,
         nodes,

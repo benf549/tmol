@@ -198,7 +198,7 @@ def assign_block_types(
         pconn_matrix,
         pconn_offsets,
         block_n_conn,
-        pose_n_pconn,
+        _,
     ) = PoseStackBuilder._take_real_conn_conn_intrablock_pairs(
         pbt, block_type_ind64, is_real_res
     )
@@ -212,7 +212,7 @@ def assign_block_types(
     # bad naming because python indentation- and line-wrapping rules are annoying:
     # inter_block_bondsep64 == ibb64
     ibb64 = PoseStackBuilder._calculate_interblock_bondsep_from_connectivity_graph(
-        pbt, block_n_conn, pose_n_pconn, pconn_matrix
+        pbt, pconn_offsets, block_n_conn, pconn_matrix
     )
 
     return (block_type_ind64, inter_residue_connections64, ibb64)
@@ -226,27 +226,47 @@ def _assert_connections_are_well_formed(
     partner_conn = inter_residue_connections64[..., 1]
     has_partner = partner >= 0
 
+    n_poses, n_blocks, n_connections = partner.shape
+    pose = torch.arange(n_poses, device=partner.device)[:, None, None]
+    block = torch.arange(n_blocks, device=partner.device)[None, :, None]
+    safe_partner = partner.clamp(0, n_blocks - 1)
+    safe_partner_conn = partner_conn.clamp(0, n_connections - 1)
+    partner_resolved = block_type_ind64[pose, safe_partner] >= 0
+    points_back = (
+        inter_residue_connections64[pose, safe_partner, safe_partner_conn, 0] == block
+    )
+    bad_mask = has_partner & (
+        (block_type_ind64[:, :, None] < 0)
+        | (partner >= n_blocks)
+        | ~partner_resolved
+        | (partner_conn < 0)
+        | (partner_conn >= n_connections)
+        | ~points_back
+    )
+    if not torch.any(bad_mask):
+        return
+
     bad = []
-    for pose, block, conn in torch.nonzero(has_partner, as_tuple=False).tolist():
-        p = int(partner[pose, block, conn])
-        pc = int(partner_conn[pose, block, conn])
-        if int(block_type_ind64[pose, block]) < 0:
-            bad.append(f"block {block} has no resolved type but connects to {p}")
-        elif int(block_type_ind64[pose, p]) < 0:
-            bad.append(f"block {block} connects to {p}, which has no resolved type")
-        elif pc < 0:
-            bad.append(f"block {block} conn {conn} names block {p} connection {pc}")
-        elif int(inter_residue_connections64[pose, p, pc, 0]) != block:
+    for pose_i, block_i, conn_i in torch.nonzero(bad_mask, as_tuple=False)[
+        :20
+    ].tolist():
+        p = int(partner[pose_i, block_i, conn_i])
+        pc = int(partner_conn[pose_i, block_i, conn_i])
+        if int(block_type_ind64[pose_i, block_i]) < 0:
+            bad.append(f"block {block_i} has no resolved type but connects to {p}")
+        elif p >= n_blocks:
+            bad.append(f"block {block_i} connects to invalid block {p}")
+        elif int(block_type_ind64[pose_i, p]) < 0:
+            bad.append(f"block {block_i} connects to {p}, which has no resolved type")
+        elif pc < 0 or pc >= n_connections:
+            bad.append(f"block {block_i} conn {conn_i} names block {p} connection {pc}")
+        else:
+            back = int(inter_residue_connections64[pose_i, p, pc, 0])
             bad.append(
-                f"block {block} conn {conn} points at block {p} conn {pc}, "
-                f"which points back at {int(inter_residue_connections64[pose, p, pc, 0])}"
+                f"block {block_i} conn {conn_i} points at block {p} conn {pc}, "
+                f"which points back at {back}"
             )
-        if bad and len(bad) >= 20:
-            break
-    if bad:
-        raise RuntimeError(
-            "malformed inter-residue connections:\n  " + "\n  ".join(bad)
-        )
+    raise RuntimeError("malformed inter-residue connections:\n  " + "\n  ".join(bad))
 
 
 @validate_args
@@ -594,7 +614,6 @@ def select_best_block_type_candidate(  # noqa: C901
         best_candidate_ind2[is_real_res],
     ]
     if torch.any(best_candidate_score >= warning_threshold):
-
         nz_is_real_candidate = torch.nonzero(is_real_candidate)
         err_msg = []
         for cand_ind in range(nz_is_real_candidate.shape[0]):
@@ -633,10 +652,10 @@ def select_best_block_type_candidate(  # noqa: C901
 
             if real_candidate_should_be_excluded[cand_ind]:
                 equiv_class = cand_bt.io_equiv_class
-                for l in range(
+                for atom_ind in range(
                     len(canonical_ordering.restypes_ordered_atom_names[equiv_class])
                 ):
-                    if real_candidate_provided_atoms_absent[cand_ind, l]:
+                    if real_candidate_provided_atoms_absent[cand_ind, atom_ind]:
                         err_msg.extend(
                             [
                                 str(x)
@@ -644,7 +663,7 @@ def select_best_block_type_candidate(  # noqa: C901
                                     " atom",
                                     canonical_ordering.restypes_ordered_atom_names[
                                         equiv_class
-                                    ][l],
+                                    ][atom_ind],
                                     "provided but absent from candidate",
                                     cand_bt.name + "\n",
                                 )
@@ -653,10 +672,12 @@ def select_best_block_type_candidate(  # noqa: C901
 
             if real_candidate_canonical_atom_was_not_provided[cand_ind].any():
                 equiv_class = cand_bt.io_equiv_class
-                for l in range(
+                for atom_ind in range(
                     len(canonical_ordering.restypes_ordered_atom_names[equiv_class])
                 ):
-                    if real_candidate_canonical_atom_was_not_provided[cand_ind, l]:
+                    if real_candidate_canonical_atom_was_not_provided[
+                        cand_ind, atom_ind
+                    ]:
                         err_msg.extend(
                             [
                                 str(x)
@@ -664,7 +685,7 @@ def select_best_block_type_candidate(  # noqa: C901
                                     " atom",
                                     canonical_ordering.restypes_ordered_atom_names[
                                         equiv_class
-                                    ][l],
+                                    ][atom_ind],
                                     "missing but present in candidate",
                                     cand_bt.name + "\n",
                                 )
@@ -681,8 +702,7 @@ def select_best_block_type_candidate(  # noqa: C901
         failure_threshold = 2 * warning_threshold
         if torch.any(best_candidate_score >= failure_threshold):
             raise RuntimeError(err_msg + "Best candidate exceeds failure threshold")
-        else:
-            logger.warning(err_msg)
+        logger.warning(err_msg)
 
     block_type_ind64_2 = torch.full_like(res_types64, -1)
     block_type_ind64_2[is_real_res] = block_type_candidates[
@@ -937,11 +957,11 @@ def _collect_var_combo_candidates(
                 var_combo_n_candidates[i, j, k] = len(
                     pbt_io_equiv_class_candidates[bt_name3][j][k]
                 )
-                for l, (bt, bt_ind) in enumerate(
+                for candidate_ind, (bt, bt_ind) in enumerate(
                     pbt_io_equiv_class_candidates[bt_name3][j][k]
                 ):
-                    var_combo_candidate_bt_index[i, j, k, l] = bt_ind
-                    var_combo_is_real_candidate[i, j, k, l] = True
+                    var_combo_candidate_bt_index[i, j, k, candidate_ind] = bt_ind
+                    var_combo_is_real_candidate[i, j, k, candidate_ind] = True
     return (
         var_combo_candidate_bt_index,
         var_combo_is_real_candidate,

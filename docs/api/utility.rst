@@ -4,7 +4,6 @@ Utilities
 .. automodule:: tmol.utility
    :members:
    :imported-members:
-   :undoc-members:
    :show-inheritance:
 
 Public aliases and units
@@ -20,3 +19,10 @@ Public aliases and units
    ClassLogger
    DihedralAngle
    ureg
+
+Tensor utilities
+----------------
+
+.. automodule:: tmol.utility.tensor
+   :members:
+   :imported-members:

@@ -19,6 +19,7 @@ from tmol.pack.rotamer import ConformerSampler
 
 @attr.s(auto_attribs=True, frozen=True)
 class IncludeCurrentSampler(ConformerSampler):
+    """Add each packable residue's current conformation to its rotamer set."""
 
     @classmethod
     def sampler_name(cls):
@@ -74,7 +75,7 @@ class IncludeCurrentSampler(ConformerSampler):
             ],
         ).to(torch.int32)
 
-        gbt_for_rotamer = torch.nonzero(n_rots_for_gbt, as_tuple=True)[0]
+        gbt_for_rotamer = n_rots_for_gbt.nonzero(as_tuple=True)[0].to(torch.int32)
         return (n_rots_for_gbt, gbt_for_rotamer, {})
 
     def fill_dofs_for_samples(

@@ -4,6 +4,8 @@
 error_this_should_not_be_compiled();  // nvcc should not include this file
 #endif
 
+#include <ATen/Parallel.h>
+
 #include "device_operations.hh"
 #include <tmol/utility/tensor/context_manager.hh>
 
@@ -20,13 +22,49 @@ struct DeviceOperations<tmol::Device::CPU> {
     }
   }
 
-  template <typename Int, typename Func>
-  static void forall_stacks(ContextManager&, Int Nstacks, Int N, Func f) {
-    for (int stack = 0; stack < Nstacks; ++stack) {
-      for (Int i = 0; i < N; ++i) {
-        f(stack, i);
+  template <typename launch_t, typename Func>
+  static void forall_independent(ContextManager&, int N, Func f) {
+    constexpr int64_t min_parallel_work = 32768;
+    if (N < min_parallel_work) {
+      for (int i = 0; i < N; ++i) {
+        f(i);
       }
+      return;
     }
+
+    at::parallel_for(0, N, 1, [=](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        f(int(i));
+      }
+    });
+  }
+
+  template <typename launch_t, typename Func>
+  static void forall_grouped(
+      ContextManager& mgr, int n_groups, int items_per_group, Func f) {
+    if (n_groups <= 1) {
+      forall<launch_t>(mgr, n_groups * items_per_group, f);
+      return;
+    }
+
+    at::parallel_for(0, n_groups, 1, [=](int64_t begin, int64_t end) {
+      for (int64_t group = begin; group < end; ++group) {
+        int const first_item = group * items_per_group;
+        for (int item = 0; item < items_per_group; ++item) {
+          f(first_item + item);
+        }
+      }
+    });
+  }
+
+  static EIGEN_DEVICE_FUNC void store_idempotent(
+      int32_t& target, int32_t value) {
+    __atomic_store_n(&target, value, __ATOMIC_RELAXED);
+  }
+
+  static EIGEN_DEVICE_FUNC void store_idempotent(
+      int64_t& target, int64_t value) {
+    __atomic_store_n(&target, value, __ATOMIC_RELAXED);
   }
 
   template <typename Int, typename Func>
@@ -46,6 +84,48 @@ struct DeviceOperations<tmol::Device::CPU> {
     for (int i = 0; i < n_workgroups; ++i) {
       f(i);
     }
+  }
+
+  template <typename launch_t, typename Func>
+  static void foreach_independent_workgroup(
+      ContextManager&, int n_workgroups, Func f) {
+    constexpr int64_t min_parallel_workgroups = 256;
+    if (n_workgroups < min_parallel_workgroups) {
+      for (int i = 0; i < n_workgroups; ++i) {
+        f(i);
+      }
+      return;
+    }
+
+    at::parallel_for(0, n_workgroups, 1, [=](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        f(int(i));
+      }
+    });
+  }
+
+  template <typename launch_t, typename Func>
+  static void foreach_grouped_workgroup(
+      ContextManager& mgr, int n_groups, int workgroups_per_group, Func f) {
+    if (n_groups <= 1) {
+      foreach_workgroup<launch_t>(mgr, n_groups * workgroups_per_group, f);
+      return;
+    }
+
+    at::parallel_for(0, n_groups, 1, [=](int64_t begin, int64_t end) {
+      for (int64_t group = begin; group < end; ++group) {
+        int const first_workgroup = group * workgroups_per_group;
+        for (int i = 0; i < workgroups_per_group; ++i) {
+          f(first_workgroup + i);
+        }
+      }
+    });
+  }
+
+  template <typename launch_t, typename Func>
+  static void foreach_pose_workgroup(
+      ContextManager& mgr, int n_poses, int workgroups_per_pose, Func f) {
+    foreach_grouped_workgroup<launch_t>(mgr, n_poses, workgroups_per_pose, f);
   }
 
   template <mgpu::scan_type_t scan_type, typename T, typename OP>

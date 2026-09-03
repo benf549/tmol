@@ -22,7 +22,7 @@ Requirements:
 - Python 3.11 or newer.
 - PyTorch 2.5 or newer.
 - A C++17 compiler.
-- CMake 3.18 or newer.
+- CMake 3.24 or newer.
 - CUDA toolkit with `nvcc` for CUDA builds.
 
 Without CUDA, use a CPU-only build:
@@ -53,7 +53,7 @@ Important CMake variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CMAKE_CUDA_ARCHITECTURES` | `80;86;89;90` | GPU architectures to compile. |
+| `CMAKE_CUDA_ARCHITECTURES` | `native` | `native` compiles only for GPUs visible at configure time. `all`, used for release wheels, emits SASS for every sm_75+ target reported by `nvcc --list-gpu-code`, plus PTX for the newest target. |
 | `TMOL_BUILD_TESTS` | `OFF` | Build test-only extensions. |
 | `TMOL_NVCC_THREADS` | `4` | Threads per `nvcc` invocation. |
 | `TMOL_ENABLE_CUDA` | `ON` | Turn off for CPU-only builds. |
@@ -117,14 +117,17 @@ apptainer run --nv --bind "$(pwd):/tmol_host" tmol-dev.sif
 
 ## CI
 
-GitHub Actions runs linting, CPU tests, CUDA tests, and benchmarks on the
-self-hosted GPU runner. The docs workflow builds Sphinx docs on PRs and pushes
-to `master`; PR builds upload rendered HTML artifacts and same-repository PRs
-also publish preview docs under the Pages site.
+GitHub Actions runs linting, the Linux x86-64, Linux aarch64, and Apple Silicon
+CPU suites, and CPU documentation builds on hosted runners. CUDA tests,
+benchmarks, and the CUDA-only tutorial smoke tests use the self-hosted DIGS
+runner. PR docs builds upload rendered HTML artifacts; same-repository PRs also
+publish previews under the Pages site.
 
 ## Releasing
 
-Versioned wheel and sdist publication happens from `v*` tags. The tag version
+Versioned wheel and sdist publication happens from `v*` tags. Linux x86-64,
+Linux aarch64, and Apple Silicon CPU wheels are built for each supported
+CPython version and qualified by their PyTorch minor. The tag version
 must match `[project].version` in `pyproject.toml`.
 
 Before using a versioned wheel URL, check the GitHub Releases page. The version

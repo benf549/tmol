@@ -36,7 +36,15 @@ pip install "torch==2.12.*" --index-url https://download.pytorch.org/whl/cu132
 
 Wheel tags select Python, PyTorch, and CUDA compatibility. For example,
 `cp313` selects Python 3.13 and `+cu130torch2.13` selects the CUDA/PyTorch lane.
-They do not replace the host C++ runtime.
+CPU wheels are also PyTorch-minor-specific: `+cputorch2.13` selects the CPU
+extension built against PyTorch 2.13. They do not replace the host C++ runtime.
+
+Release builds provide CPU wheels for Linux x86-64, Linux aarch64, and Apple
+Silicon. For example, after installing PyTorch 2.13, an Apple Silicon wheel is:
+
+```bash
+pip install "tmol @ https://github.com/uw-ipd/tmol/releases/download/vX.Y.Z/tmol-X.Y.Z+cputorch2.13-cp313-cp313-macosx_14_0_arm64.whl"
+```
 
 ## PyPI Source Distribution
 
@@ -83,11 +91,17 @@ The same CPU-only path is the normal macOS source install:
 pip install -e . -Ccmake.define.TMOL_ENABLE_CUDA=OFF
 ```
 
+CPU source builds and release wheels are tested on Linux x86-64, Linux
+aarch64, and Apple Silicon. Native Windows is not currently supported; use a
+Linux environment such as WSL2.
+
 ## Linux Runtime Notes
 
-Release wheels use `manylinux_2_28` platform tags on `x86_64` and `aarch64`.
-They require glibc 2.28 or newer. PyTorch supplies the matching CUDA shared
-libraries; TMol wheels do not bundle the PyTorch or NVIDIA runtime libraries.
+Linux release wheels use `manylinux_2_28` platform tags on `x86_64` and
+`aarch64`. They require glibc 2.28 or newer. Apple Silicon wheels use
+`macosx_14_0_arm64`, matching the PyTorch 2.13 deployment target. PyTorch
+supplies the matching shared libraries; TMol wheels do not bundle the PyTorch
+or NVIDIA runtime libraries.
 
 If `import tmol` fails with a `GLIBCXX_* not found` error, the host
 `libstdc++` is too old for the wheel. Use one of these paths:
@@ -112,15 +126,16 @@ python -c "import sys, torch; print(f'Python {sys.version_info.major}.{sys.versi
 
 ## Google Colab
 
-The current Colab GPU runtime uses Python 3.12, PyTorch 2.11.0 with CUDA 12.8,
-and commonly a Turing T4 (`sm_75`). TMol v0.1.49 provides a matching wheel
-compiled for T4 (`sm_75`), A100 (`sm_80`), and L4 (`sm_89`) GPUs:
+Colab GPU runtimes currently use PyTorch 2.11.0 with CUDA 12.8 and may provide
+Python 3.12 or 3.13. TMol v0.1.53 provides separate Python-ABI wheels compiled
+for T4 (`sm_75`), A100 (`sm_80`), and L4 (`sm_89`) GPUs. For Python 3.13:
 
 ```bash
-pip install "tmol @ https://github.com/uw-ipd/tmol/releases/download/v0.1.49/tmol-0.1.49+cu128torch2.11-cp312-cp312-manylinux_2_28_x86_64.whl"
+pip install "tmol @ https://github.com/uw-ipd/tmol/releases/download/v0.1.53/tmol-0.1.53+cu128torch2.11-cp313-cp313-manylinux_2_28_x86_64.whl"
 ```
 
-The tutorial bootstrap installs this wheel directly and constrains pip to keep
-Colab's active PyTorch. It stops with a clear compatibility error instead of
-attempting a long source build when Python, PyTorch, or CUDA do not match.
-Always confirm the active versions before installing an ABI-specific wheel URL.
+The tutorial bootstrap selects the wheel matching the runtime's Python ABI and
+constrains pip to keep Colab's active PyTorch. It stops with a clear
+compatibility error instead of attempting a long source build when Python,
+PyTorch, or CUDA do not match. Always confirm the active versions before
+installing an ABI-specific wheel URL.

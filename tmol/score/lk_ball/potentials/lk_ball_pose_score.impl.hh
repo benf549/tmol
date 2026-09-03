@@ -674,8 +674,8 @@ class LKBallPoseScoreDispatch {
             scratch_rot_neighbors,
             max_dis);
     // 3 Only the forward pass in this calculation
-    DeviceDispatch<Dev>::template foreach_workgroup<launch_t>(
-        mgr, n_poses * max_n_upper_triangle_inds, eval_energies_by_block);
+    DeviceDispatch<Dev>::template foreach_pose_workgroup<launch_t>(
+        mgr, n_poses, max_n_upper_triangle_inds, eval_energies_by_block);
 
     return {output_t, scratch_rot_neighbors_t};
   }
@@ -810,6 +810,10 @@ class LKBallPoseScoreDispatch {
       int const weight_block2 = block_pair_scoring ? block_ind2 : 0;
       for (int i = 0; i < 4; ++i) {
         local_dTdV[i] = dTdV[i][pose_ind][weight_block1][weight_block2];
+      }
+      if (block_pair_scoring && local_dTdV[0] == 0 && local_dTdV[1] == 0
+          && local_dTdV[2] == 0 && local_dTdV[3] == 0) {
+        return;
       }
 
       auto lk_ball_atom_derivs =
@@ -977,8 +981,8 @@ class LKBallPoseScoreDispatch {
 
     // Since we have the sphere overlap results from the forward pass,
     // there's only a single kernel launch here
-    DeviceDispatch<Dev>::template foreach_workgroup<launch_t>(
-        mgr, n_poses * max_n_upper_triangle_inds, eval_derivs);
+    DeviceDispatch<Dev>::template foreach_pose_workgroup<launch_t>(
+        mgr, n_poses, max_n_upper_triangle_inds, eval_derivs);
 
     return {dV_d_pose_coords_t, dV_d_water_coords_t};
   }
@@ -1354,7 +1358,7 @@ class LKBallRotamerScoreDispatch {
     // context(wrapped_stream.stream());
 
     // 3 Only the forward pass in this calculation
-    DeviceDispatch<Dev>::template foreach_workgroup<launch_t>(
+    DeviceDispatch<Dev>::template foreach_independent_workgroup<launch_t>(
         mgr, dispatch_indices.size(1), eval_energies_by_block);
 
     return {output_t, dispatch_indices_t};

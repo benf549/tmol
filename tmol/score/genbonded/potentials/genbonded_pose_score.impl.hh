@@ -438,9 +438,11 @@ auto GenBondedPoseScoreDispatch<DeviceOps, D, Real, Int>::forward(
   // One score type: gen_torsions (index 0).
   int const n_V = output_block_pair_energies ? max_n_blocks : 1;
   auto V_t = TPack<Real, 4, D>::zeros({1, n_poses, n_V, n_V});
-  auto dV_dx_t = compute_derivs
+  // Block-pair autograd recomputes coordinate derivatives in backward.
+  bool const accumulate_derivs = compute_derivs && !output_block_pair_energies;
+  auto dV_dx_t = accumulate_derivs
                      ? TPack<Vec<Real, 3>, 2, D>::zeros({1, n_atoms})
-                     : TPack<Vec<Real, 3>, 2, D>::empty({1, n_atoms});
+                     : TPack<Vec<Real, 3>, 2, D>::empty({1, 0});
   auto V = V_t.view;
   auto dV_dx = dV_dx_t.view;
 
@@ -485,7 +487,7 @@ auto GenBondedPoseScoreDispatch<DeviceOps, D, Real, Int>::forward(
               prm[4]   // offset
           );
           accumulate_torsion_result<Real, Int, D>(
-              score, eval, atoms, compute_derivs, dV_dx[0], 1.0);
+              score, eval, atoms, accumulate_derivs, dV_dx[0], 1.0);
         });
 
     // -----------------------------------------------------------------------
@@ -503,7 +505,7 @@ auto GenBondedPoseScoreDispatch<DeviceOps, D, Real, Int>::forward(
               prm[1]   // delta
           );
           accumulate_torsion_result<Real, Int, D>(
-              score, eval, atoms, compute_derivs, dV_dx[0], 1.0);
+              score, eval, atoms, accumulate_derivs, dV_dx[0], 1.0);
         });
 
     int block_ind2 = -1;
@@ -683,9 +685,10 @@ auto GenBondedPoseScoreDispatch<DeviceOps, D, Real, Int>::forward(
     DeviceOps<D>::template for_each_in_workgroup<nt>(reduce_and_write);
   });
 
-  DeviceOps<D>::template foreach_workgroup<launch_t>(
+  DeviceOps<D>::template foreach_pose_workgroup<launch_t>(
       mgr,
-      n_poses * max_n_blocks * (max_n_conns + 1),
+      n_poses,
+      max_n_blocks * (max_n_conns + 1),
       eval_torsions_for_interaction);
 
   return {V_t, dV_dx_t};
@@ -763,6 +766,7 @@ auto GenBondedPoseScoreDispatch<DeviceOps, D, Real, Int>::backward(
                                        int bblock_ind1,
                                        int bblock_ind2) {
       Real const block_weight = dTdV[0][bpose_ind][bblock_ind1][bblock_ind2];
+      if (block_weight == 0) return;
       auto eval = gbtorsion_V_dV(
           rot_coords[atoms[0]],
           rot_coords[atoms[1]],
@@ -786,6 +790,7 @@ auto GenBondedPoseScoreDispatch<DeviceOps, D, Real, Int>::backward(
                                         int bblock_ind1,
                                         int bblock_ind2) {
       Real const block_weight = dTdV[0][bpose_ind][bblock_ind1][bblock_ind2];
+      if (block_weight == 0) return;
       auto eval = gbimproper_V_dV(
           rot_coords[atoms[0]],
           rot_coords[atoms[1]],
@@ -937,9 +942,10 @@ auto GenBondedPoseScoreDispatch<DeviceOps, D, Real, Int>::backward(
     // add.
   });
 
-  DeviceOps<D>::template foreach_workgroup<launch_t>(
+  DeviceOps<D>::template foreach_pose_workgroup<launch_t>(
       mgr,
-      n_poses * max_n_blocks * (max_n_conns + 1),
+      n_poses,
+      max_n_blocks * (max_n_conns + 1),
       eval_torsions_for_interaction);
 
   return dV_dx_t;
@@ -1257,8 +1263,13 @@ auto GenBondedRotamerScoreDispatch<DeviceOps, D, Real, Int>::forward(
     });
     DeviceOps<D>::template for_each_in_workgroup<nt>(reduce_and_write);
   });
-  DeviceOps<D>::template foreach_workgroup<launch_t>(
-      mgr, n_output_intxns_total, eval_torsions_for_interaction);
+  if (compute_derivs) {
+    DeviceOps<D>::template foreach_workgroup<launch_t>(
+        mgr, n_output_intxns_total, eval_torsions_for_interaction);
+  } else {
+    DeviceOps<D>::template foreach_independent_workgroup<launch_t>(
+        mgr, n_output_intxns_total, eval_torsions_for_interaction);
+  }
 
   return {
       V_t,

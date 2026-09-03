@@ -34,6 +34,7 @@ want a complete walkthrough rather than a lookup table.
 | Build default, empty, or focused score functions | {doc}`Scoring workflow </user_guide/scoring>`; {doc}`Tutorial 03 <03_scoring_and_analysis>` | See the {doc}`score API </api/score>` and {doc}`term map </api/score_terms>`. |
 | Score a pose or backpropagate through coordinates | {doc}`Scoring workflow </user_guide/scoring>`; {doc}`Tutorial 03 <03_scoring_and_analysis>` | Render a module for the current pose layout and call it with coordinates. |
 | Analyze weighted or unweighted block pairs | {doc}`Scoring workflow </user_guide/scoring>`; {doc}`Tutorial 03 <03_scoring_and_analysis>` | Directed accounting can require both matrix orientations for an unordered pair. |
+| Map a protein interface and test selected alanine substitutions | {doc}`Protein-interface workflow </workflows/protein_interfaces>`; {doc}`Case Study 09 <09_protein_interface_hotspot_scan>` | Compose author-label masks, both block-pair orientations, and matched local-repacking tasks. Report one-complex score changes, not thermodynamic ΔΔG. |
 | Reweight an interface differentiably | {doc}`Tutorial 03 <03_scoring_and_analysis>` | Apply an explicit analytical weight tensor before summing and backpropagating. |
 | Add distance, coordinate, or torsion constraints | {doc}`Optimization workflow </user_guide/optimization>`; {doc}`Tutorial 05 <05_minimization_constraints_kinematics>` | See the {doc}`constraint API </api/score_terms>`. `constrain_all_ca()` is protein-specific; main-chain restraints follow block declarations. |
 
@@ -46,6 +47,7 @@ want a complete walkthrough rather than a lookup table.
 | Add extra χ sampling | {doc}`Packing workflow </workflows/packing>`; {doc}`Tutorial 04 <04_packing_and_mutation_scan>` | TMol χ indices are zero-based: `0` is χ1 and `1` is χ2. |
 | Run regional design or a small mutation-score experiment | {doc}`Packing workflow </workflows/packing>`; {doc}`Tutorial 04 <04_packing_and_mutation_scan>` | Compose explicit task masks. TMol has no built-in Rosetta resfile, selector, or mutation-scan protocol layer. |
 | Prepare and inject ligand parameters | {doc}`Ligand workflow </user_guide/ligands>`; {doc}`Tutorial 07 <07_ligand_and_params>` | Start from authoritative CIF/MOL2 chemistry. The Rosetta `.params` writer is syntactic and experimental. |
+| Score controlled ligand-pose decoys and locally refine diagnostic states | {doc}`Case Study 10 <10_ligand_pose_sensitivity>` | Reuse one ligand-aware context, batch matched rigid-body decoys, and report pose sensitivity rather than docking or binding affinity. |
 | Score or pack DNA/RNA | {doc}`Nucleic-acid workflow </workflows/nucleic_acids>`; {doc}`Tutorial 08 <08_nucleic_acids>` | Sugar-pucker sampling and full RosettaDNA/RNA protocols are not implemented. |
 
 ## Availability labels

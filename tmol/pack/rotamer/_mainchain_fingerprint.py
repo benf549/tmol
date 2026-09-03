@@ -9,7 +9,7 @@ from tmol.types import (
     Tensor,
     validate_args,
 )
-from tmol.numeric import coord_dihedrals
+from tmol.numeric._dihedrals import _numpy_coord_dihedrals
 from tmol.database import PatchedChemicalDatabase
 from tmol.chemical import RefinedResidueType
 from tmol.pose import PackedBlockTypes
@@ -82,6 +82,8 @@ from tmol.pack.rotamer import (
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
 class AtomFingerprint:
+    """Topology signature locating an atom relative to the main chain."""
+
     mc_ind: int
     mc_bond_dist: int
     chirality: int
@@ -91,6 +93,8 @@ class AtomFingerprint:
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
 class MCFingerprint:
+    """Main-chain atom fingerprint and its residue-local atom mapping."""
+
     mc_ats: NDArray[numpy.int32][:]
     mc_at_fingerprints: Tuple[AtomFingerprint, ...]
     fingerprint: Tuple[AtomFingerprint, ...]
@@ -99,6 +103,8 @@ class MCFingerprint:
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
 class MCFingerprints:
+    """Packed main-chain fingerprint mappings indexed by conformer sampler."""
+
     atom_mapping: Tensor[torch.int32][:, :, :, :]  # make int64
     sampler_mapping: Mapping[str, int]
     max_sampler: Tensor[torch.int32][:]
@@ -169,8 +175,6 @@ def create_non_sidechain_fingerprint(  # noqa: C901
         n_bonds[rt.bond_indices[i, 0]] += 1
         n_nonh_bonds[rt.connection_to_idx[conn]] += 1
 
-    # mc_ancestors = numpy.full(rt.n_atoms, -1, dtype=numpy.int32)
-    # chiralities = numpy.full(rt.n_atoms, -1, dtype=numpy.int32)
     non_sc_atom_fingerprints = []
     at_for_fingerprint = {}
     fp_seen_count = {}
@@ -220,19 +224,14 @@ def create_non_sidechain_fingerprint(  # noqa: C901
 
                 mc_anc_icoor_ind = rt.at_to_icoor_ind[mc_anc]
 
-                def t64(coord):
-                    return torch.tensor(coord, dtype=torch.float64).unsqueeze(0)
-
-                at1_coord = t64(rt.ideal_coords[mc1_icoor_ind])
-                at2_coord = t64(rt.ideal_coords[mc_anc_icoor_ind])
-                at3_coord = t64(rt.ideal_coords[mc2_icoor_ind])
-                at4_coord = t64(rt.ideal_coords[rt.at_to_icoor_ind[nsc_at]])
-
-                # now we have four coordinates, measure the dihedral
+                # Measure the improper dihedral around the main-chain atom.
                 dihe = numpy.degrees(
-                    coord_dihedrals(at4_coord, at2_coord, at1_coord, at3_coord).numpy()[
-                        0
-                    ]
+                    _numpy_coord_dihedrals(
+                        rt.ideal_coords[rt.at_to_icoor_ind[nsc_at]],
+                        rt.ideal_coords[mc_anc_icoor_ind],
+                        rt.ideal_coords[mc1_icoor_ind],
+                        rt.ideal_coords[mc2_icoor_ind],
+                    )
                 )
                 # some atoms are going to be placed in the plane
                 # defined by the three "main chain" atoms. If the
@@ -420,13 +419,8 @@ def find_unique_fingerprints(  # noqa: C901
 
     # we do not need to re-annotate this PackedBlockTypes object if there
     # are no sidechain samplers that it has not encountered before
-    if hasattr(pbt, "mc_atom_mapping"):
-        all_found = True
-        for bt in sampler_types:
-            if bt not in pbt.mc_atom_mapping:
-                all_found = False
-                break
-        if all_found:
+    if hasattr(pbt, "mc_fingerprints"):
+        if sampler_types.issubset(pbt.mc_fingerprints.sampler_mapping):
             return
     sampler_types = sorted(list(sampler_types))
     n_samplers = len(sampler_types)

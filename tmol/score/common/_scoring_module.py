@@ -4,16 +4,33 @@ import torch
 from tmol.score.common import convert_float64
 
 
-class _ZeroCoordinates(torch.autograd.Function):
-    """Attach a no-op coordinate gradient without launching a device kernel."""
+class _CoordinateIndependentScore(torch.autograd.Function):
+    """Attach a no-op coordinate edge without launching a device kernel."""
 
     @staticmethod
-    def forward(ctx, coords, zero, shape):
-        return zero.expand(shape)
+    def forward(ctx, coords, score):
+        return score
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None
+        return None, grad_output
+
+
+def _coordinate_independent_score(
+    coords: torch.Tensor, score: torch.Tensor
+) -> torch.Tensor:
+    """Preserve backward compatibility for a coordinate-independent score.
+
+    Args:
+        coords: Coordinates accepted by the score term.
+        score: A score with no mathematical dependence on ``coords``.
+
+    Returns:
+        ``score`` with a no-op autograd edge only when ``coords`` requires one.
+    """
+    if torch.is_grad_enabled() and coords.requires_grad:
+        return _CoordinateIndependentScore.apply(coords, score)
+    return score
 
 
 class ZeroTermPoseScoringModule(torch.nn.Module):
@@ -45,9 +62,7 @@ class ZeroTermPoseScoringModule(torch.nn.Module):
         # backward() even when that term has no coordinate dependence. Attach
         # a custom no-op edge so that convention remains valid without a
         # reduction kernel or a persistent leaf gradient.
-        if torch.is_grad_enabled() and coords.requires_grad:
-            return _ZeroCoordinates.apply(coords, zero, self.shape)
-        return zero.expand(self.shape)
+        return _coordinate_independent_score(coords, zero.expand(self.shape))
 
 
 class TermScoringModule(torch.nn.Module):
@@ -65,17 +80,22 @@ class TermScoringModule(torch.nn.Module):
 
         self.term_score_poses = term_score_poses
 
-    def _build_static_tails(self, block_pair_scoring):
-        # Pre-build the (non-coords) portion of the arg list once,
-        #    for both float32 and float64 coord dtypes.
-        # Reused across every forward call to eliminat repeated cats/conversions
-        # (fd) if f32+f64 is too wasteful, make this a ScoringModule input?
+    def _build_static_tails(self, block_pair_scoring: bool) -> None:
+        # Pre-build the non-coordinate argument list used by every forward.
+        # Float64 scoring is mainly used by gradcheck, so defer those copies
+        # until a float64 input actually arrives.
         tail = list(self.common_parameters) + list(self.term_parameters)
         self._static_tail_f32 = tuple(tail) + (block_pair_scoring,)
+        self._static_tail_f64 = None
 
-        tail_f64 = list(tail)
-        convert_float64(tail_f64)
-        self._static_tail_f64 = tuple(tail_f64) + (block_pair_scoring,)
+    def _static_tail_for_coords(self, coords: torch.Tensor) -> tuple[object, ...]:
+        if coords.dtype != torch.float64:
+            return self._static_tail_f32
+        if self._static_tail_f64 is None:
+            tail_f64 = list(self._static_tail_f32[:-1])
+            convert_float64(tail_f64)
+            self._static_tail_f64 = tuple(tail_f64) + (self._static_tail_f32[-1],)
+        return self._static_tail_f64
 
     def add_parameters(self, table, params):
         def _p(t):
@@ -131,7 +151,6 @@ class TermWholePoseScoringModule(TermPoseScoringModule):
         super(TermWholePoseScoringModule, self).__init__(
             classname, pose_stack, term_parameters, term_score_poses
         )
-        self.count = 0
         self._build_static_tails(False)
 
     def forward(
@@ -139,11 +158,7 @@ class TermWholePoseScoringModule(TermPoseScoringModule):
         coords,
     ):
         flat = coords.flatten(start_dim=0, end_dim=-2)
-        tail = (
-            self._static_tail_f64
-            if coords.dtype == torch.float64
-            else self._static_tail_f32
-        )
+        tail = self._static_tail_for_coords(coords)
         # ignore the dispatch_indices return tensor
         scores, _ = self.term_score_poses(flat, *tail)
         return scores
@@ -167,11 +182,7 @@ class TermBlockPairScoringModule(TermPoseScoringModule):
         coords,
     ):
         flat = coords.flatten(start_dim=0, end_dim=-2)
-        tail = (
-            self._static_tail_f64
-            if coords.dtype == torch.float64
-            else self._static_tail_f32
-        )
+        tail = self._static_tail_for_coords(coords)
         scores, _ = self.term_score_poses(flat, *tail)
         return scores
 
@@ -224,11 +235,7 @@ class TermRotamerScoringModule(TermScoringModule):
         indices: [3, nnz]          int32  (pose, rot_i, rot_j in global rot numbering)
         """
         flat = coords.flatten(start_dim=0, end_dim=-2)
-        tail = (
-            self._static_tail_f64
-            if coords.dtype == torch.float64
-            else self._static_tail_f32
-        )
+        tail = self._static_tail_for_coords(coords)
         scores, indices = self.term_score_poses(flat, *tail)
         return scores, indices
 

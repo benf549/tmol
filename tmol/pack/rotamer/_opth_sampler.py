@@ -71,6 +71,7 @@ class OptHSamplerPackedBlockTypeCache:
     nhq_chi_atom: Tensor[torch.int32][:]
     nhq_chi_4atoms: Tensor[torch.int32][:, 4]
     nhq_downstream_kfo: Tensor[torch.int32][:, :]
+    nhq_downstream_count: Tensor[torch.int32][:]
     is_his: Tensor[torch.bool][:]
 
     # These two tensors use 0 or 1 as an index to dim=0 to represent
@@ -120,27 +121,31 @@ def _compute_nhq_downstream_kfo(rt, nhq_rto: int) -> NDArray[numpy.int32]:
 
 
 def _opth_fill_dofs(
-    pose_stack,
-    task,
-    gbt_for_conformer,
-    block_type_ind_for_conformer,
-    n_dof_atoms_offset_for_conformer,
-    conf_inds_for_sampler,
-    orig_dofs_kto,
-    chi_atoms,
-    chi_vals,
-    conf_dofs_kto,
-    flip_NHQ,
-):
-    """Fill conf_dofs_kto for all OptHSampler rotamers
+    pose_stack: PoseStack,
+    task: "PackerTask",  # noqa: F821
+    gbt_for_conformer: Tensor[torch.int64][:],
+    block_type_ind_for_conformer: Tensor[torch.int64][:],
+    n_dof_atoms_offset_for_conformer: Tensor[torch.int64][:],
+    conf_inds_for_sampler: Tensor[torch.int64][:],
+    orig_dofs_kto: Tensor[torch.float32][:, 9],
+    chi_atoms: Tensor[torch.int32][:, :],
+    chi_vals: Tensor[torch.float32][:, :],
+    conf_dofs_kto: Tensor[torch.float32][:, 9],
+    flip_NHQ: bool,
+) -> None:
+    """Fill the packed DOF tensor for all OptHSampler rotamers.
 
     1. Copy DOFs from pose into conf_dofs_kto.
     2. For NHQ only: atoms that are kinematic children of the chi-defining atom
        of the flip are reset to their ideal DOF values
     3. Write the corrected chi torsion into DOF column 3 for
        the chi-defining atom of each flip / proton-chi rotamer.
+
+    ``chi_atoms`` and ``chi_vals`` have shape
+    ``[n_sampler_rotamers, max_n_chi]``. The packed input and output DOFs have
+    shape ``[n_atoms + 1, 9]``; row 0 is the virtual root.
     """
-    from tmol.pack.rotamer import _build_chi_phi_c_corrections
+    from tmol.pack.rotamer import _get_chi_dof_metadata
 
     pbt = pose_stack.packed_block_types
     dev = conf_dofs_kto.device
@@ -184,88 +189,41 @@ def _opth_fill_dofs(
     conf_dofs_kto[dst + 1, :] = orig_dofs_kto[src + 1, :]
 
     # Steps 2 & 3: only for rotamers that have a chi override
-    if chi_atoms.shape[0] == 0 or not (chi_atoms >= 0).any():
+    if chi_atoms.shape[0] == 0:
         return
 
-    kfidx = pbt.rotamer_kinforest.kinforest_idx  # (n_types, max_n_atoms) numpy
-    dofs_ideal_t = torch.as_tensor(
-        pbt.rotamer_kinforest.dofs_ideal, dtype=torch.float32, device=dev
-    )
-    corrections = _build_chi_phi_c_corrections(pbt)  # (n_types, max_n_chi) numpy
+    chi_mask = chi_atoms >= 0
+    has_chi_override = chi_mask.any(dim=1)
+    dofs_ideal_t = pbt.rotamer_kinforest.dofs_ideal
+    opth_cache = pbt.opth_sample_cache
 
-    reset_kto, reset_bt, reset_k = [], [], []
-    chi_kto, chi_val_list = [], []
-
-    # chi_atoms is set >= 0 only for rotamers needing a chi override:
-    # NHQ flips, HIS tautomer swaps, and proton-chi samples.  Step 2 and
-    # step 3 below run only over those rotamers.
-    flip_sis = (chi_atoms >= 0).any(dim=1).nonzero(as_tuple=True)[0].tolist()
-    for si in flip_sis:
-        bt_idx = bt_inds[si].item()
-        at_off = at_offs[si].item()
-
-        # Step 2: reset downstream atoms to ideal.
-        if flip_NHQ:
-            downstream = pbt.active_block_types[
-                bt_idx
-            ].opth_sampler_cache.nhq_downstream_kfo
-            for k in downstream:
-                k = int(k)
-                reset_kto.append(k + at_off + 1)
-                reset_bt.append(bt_idx)
-                reset_k.append(k)
-
-        # Step 3: write the chi torsion(s) into DOF column 3.
-        for chi_col in range(chi_atoms.shape[1]):
-            chi_rto = chi_atoms[si, chi_col].item()
-            if chi_rto < 0:
-                continue
-            kfo = int(kfidx[bt_idx, chi_rto])
-            corr = float(corrections[bt_idx, chi_col])
-            chi_kto.append(kfo + at_off + 1)
-            chi_val_list.append(chi_vals[si, chi_col].item() - corr)
-
-    if reset_kto:
-        conf_dofs_kto[torch.tensor(reset_kto, dtype=torch.int64, device=dev)] = (
-            dofs_ideal_t[
-                torch.tensor(reset_bt, dtype=torch.int64, device=dev),
-                torch.tensor(reset_k, dtype=torch.int64, device=dev),
-            ]
+    # Reset NHQ atoms downstream of the flipped chi to ideal geometry. Keep
+    # this entirely on-device: reading each rotamer's offsets with .item()
+    # serializes large CUDA batches.
+    if flip_NHQ:
+        downstream = opth_cache.nhq_downstream_kfo[bt_inds]
+        downstream_count = opth_cache.nhq_downstream_count[bt_inds]
+        downstream_slot = torch.arange(
+            downstream.shape[1], dtype=torch.int32, device=dev
         )
-
-    if chi_kto:
-        conf_dofs_kto[torch.tensor(chi_kto, dtype=torch.int64, device=dev), 3] = (
-            torch.tensor(chi_val_list, dtype=torch.float32, device=dev)
+        reset_mask = (downstream_slot[None, :] < downstream_count[:, None]) & (
+            has_chi_override[:, None]
         )
+        reset_k = downstream[reset_mask].to(torch.int64)
+        reset_bt = bt_inds[:, None].expand_as(downstream)[reset_mask]
+        reset_kto = (downstream + at_offs[:, None].to(downstream.dtype) + 1)[
+            reset_mask
+        ].to(torch.int64)
+        conf_dofs_kto[reset_kto] = dofs_ideal_t[reset_bt, reset_k]
 
-
-def _n_rots_for_gbt(sampler, blt, orig, orig_cache, bt, bt_cache):
-    """Return the number of rotamers OptHSampler generates for one GBT entry."""
-    # Proton chi: only for the original block type
-    if bt_cache.has_proton_chi and bt is blt.original_block_type:
-        return bt_cache.n_proton_samples
-
-    # NHQ flip
-    if sampler.flip_NHQ and orig_cache.nhq_chi_col >= 0:
-        if orig_cache.is_his:
-            # HIS/HIS_D: 2 rotamers for EVERY HIS/HIS_D considered block type
-            if bt_cache.is_his:
-                return 2
-        else:
-            # ASN/GLN: 2 rotamers only for the original block type
-            if bt is blt.original_block_type:
-                return 2
-
-    return 0
-
-
-def _chi_cols_needed(bt_cache, orig_cache, flip_NHQ):
-    """Return the minimum chi tensor width needed for a GBT with non-zero rots."""
-    if bt_cache.has_proton_chi:
-        return bt_cache.n_chi_total
-    if flip_NHQ and orig_cache.nhq_chi_col >= 0:
-        return orig_cache.nhq_chi_col + 1
-    return 1
+    # Write every chi override in one indexed assignment.
+    kfidx, corrections = _get_chi_dof_metadata(pbt)
+    safe_chi_atoms = chi_atoms.clamp_min(0).to(torch.int64)
+    rotamer_bt = bt_inds[:, None].expand_as(safe_chi_atoms)
+    chi_kto = kfidx[rotamer_bt, safe_chi_atoms] + at_offs[:, None] + 1
+    chi_cols = torch.arange(chi_atoms.shape[1], device=dev)[None, :]
+    corrected_chi = chi_vals - corrections[rotamer_bt, chi_cols]
+    conf_dofs_kto[chi_kto[chi_mask], 3] = corrected_chi[chi_mask]
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -467,6 +425,11 @@ class OptHSampler(ConformerSampler):
             dtype=torch.int32,
             device=packed_block_types.device,
         )
+        nhq_downstream_count = torch.zeros(
+            (packed_block_types.n_types,),
+            dtype=torch.int32,
+            device=packed_block_types.device,
+        )
         is_his = torch.zeros(
             (packed_block_types.n_types,),
             dtype=torch.bool,
@@ -544,6 +507,7 @@ class OptHSampler(ConformerSampler):
                 dtype=torch.int32,
                 device=packed_block_types.device,
             )
+            nhq_downstream_count[i] = len(orig_bt.opth_sampler_cache.nhq_downstream_kfo)
             is_his[i] = orig_bt.opth_sampler_cache.is_his
 
         cache = OptHSamplerPackedBlockTypeCache(
@@ -558,6 +522,7 @@ class OptHSampler(ConformerSampler):
             nhq_chi_atom=nhq_chi_atom,
             nhq_chi_4atoms=nhq_chi_4atoms,
             nhq_downstream_kfo=nhq_downstream_kfo,
+            nhq_downstream_count=nhq_downstream_count,
             is_his=is_his,
             n_samples_for_bt_by_orig_bt=n_samples_for_bt_by_orig_bt,
             n_chi_needed_for_bt=n_chi_needed_for_bt,
@@ -604,7 +569,13 @@ class OptHSampler(ConformerSampler):
                         "chi angles as part of each library rotamer."
                     )
 
-    def _measure_all_nhq_flip_chis(self, pose_stack, pose_inds, block_inds):
+    def _measure_all_nhq_flip_chis(
+        self,
+        pose_stack: PoseStack,
+        pose_inds: Tensor[torch.int64][:],
+        block_inds: Tensor[torch.int64][:],
+    ) -> Tensor[torch.float64][:]:
+        """Measure the current NHQ chi for each selected ``(pose, block)``."""
         offsets = pose_stack.block_coord_offset64[pose_inds, block_inds]
         block_types = pose_stack.block_type_ind64[pose_inds, block_inds]
         a4 = pose_stack.packed_block_types.opth_sample_cache.nhq_chi_4atoms[block_types]
@@ -614,35 +585,27 @@ class OptHSampler(ConformerSampler):
 
         c = pose_stack.coords[
             pose_inds_expanded, offsets_expanded + a4.flatten()
-        ]  # (4 * n, 3)
-        c = c.view(-1, 4, 3)  # (n, 4, 3)
+        ]  # [4 * n_selected, 3]
+        c = c.view(-1, 4, 3)  # [n_selected, 4, 3]
         c = c.to(dtype=torch.float64)
-        return coord_dihedrals(c[:, 0], c[:, 1], c[:, 2], c[:, 3])  # (n,)
+        return coord_dihedrals(c[:, 0], c[:, 1], c[:, 2], c[:, 3])
 
-    def _measure_nhq_flip_chi(self, pose_stack, coords, pose_i, block_j, orig_cache):
-        off = int(pose_stack.block_coord_offset[pose_i, block_j].item())
-        a4 = orig_cache.nhq_chi_4atoms
-        c = coords[pose_i][
-            torch.tensor(
-                [off + int(a4[k]) for k in range(4)],
-                dtype=torch.int64,
-                device=pose_stack.device,
-            )
-        ]  # (4, 3)
-        return float(coord_dihedrals(c[0:1], c[1:2], c[2:3], c[3:4])[0].item())
+    def _count_rots_and_measure_all_flips(
+        self,
+        pose_stack: PoseStack,
+        task: "SetPackerTask",  # noqa: F821
+    ) -> tuple[Tensor[torch.int32][:], int, Tensor[torch.float32][:, :]]:
+        """Count sampler rotamers and measure NHQ chis needed for flips.
 
-    def _count_rots_and_measure_all_flips(self, pose_stack, task, coords):
+        Returns:
+            Rotamer counts shaped ``[n_global_block_types]``, maximum chi
+            width, and current flip chis shaped ``[n_poses, max_n_blocks]``.
+        """
         # First we have to get the list of all the blocks where we are using
         # this sampler. Next we will identify the subset of the NHQ blocks
         # where we will measure the chi dihedrals for the flip. Then we will
         # count the number of rotamers for each block as well as the number
         # of chi columns.
-        # We will return:
-        # n_rots_for_gbt, max_n_chi_cols, pos_flip_chi
-        # n_rots_for_gbt: tensor[n_gbt]
-        # max_n_chi_cols: int
-        # pos_flip_chi: tensor[n_poses, max_n_blocks]
-
         pbt = pose_stack.packed_block_types
         optH_cache = pbt.opth_sample_cache
 
@@ -714,49 +677,16 @@ class OptHSampler(ConformerSampler):
                 pos_flip_chi[pose_inds_nhq, block_inds_nhq] = pos_flip_chi_nhq
         return n_rots_for_gbt, max_n_chi_cols, pos_flip_chi
 
-    def _count_rots_and_measure_flips(self, pose_stack, task, coords):
-        # pos_flip_chi[(pose_i, block_j)] = current last-chi in radians
-        pos_flip_chi = {}
-        n_rots_for_gbt_list = []
-        max_n_chi_cols = 1
-        for pose_i, one_pose_blts in enumerate(task.blts):
-            for block_j, blt in enumerate(one_pose_blts):
-                orig = blt.original_block_type
-                orig_cache = orig.opth_sampler_cache
-                opth_assigned = self in blt.conformer_samplers
-
-                # Measure chi-to-flip for NHQ
-                if opth_assigned and self.flip_NHQ and orig_cache.nhq_chi_col >= 0:
-                    pos_flip_chi[(pose_i, block_j)] = self._measure_nhq_flip_chi(
-                        pose_stack, coords, pose_i, block_j, orig_cache
-                    )
-
-                for bt in blt.considered_block_types:
-                    if not opth_assigned:
-                        n_rots_for_gbt_list.append(0)
-                        continue
-                    bt_cache = bt.opth_sampler_cache
-                    if not opth_assigned:
-                        n_rots_for_gbt_list.append(0)
-                        continue
-                    n_rots = _n_rots_for_gbt(self, blt, orig, orig_cache, bt, bt_cache)
-                    n_rots_for_gbt_list.append(n_rots)
-                    if n_rots > 0:
-                        max_n_chi_cols = max(
-                            max_n_chi_cols,
-                            _chi_cols_needed(bt_cache, orig_cache, self.flip_NHQ),
-                        )
-        return n_rots_for_gbt_list, max_n_chi_cols, pos_flip_chi
-
     def _fill_proton_chi_for_all_blocks(
         self,
-        pose_stack,
-        task,
-        rot_offset_for_gbt,
-        gbt_for_rotamer,
-        chi_defining_atom_for_rotamer,
-        chi_for_rotamers,
-    ):
+        pose_stack: PoseStack,
+        task: "SetPackerTask",  # noqa: F821
+        rot_offset_for_gbt: Tensor[torch.int32][:],
+        gbt_for_rotamer: Tensor[torch.int32][:],
+        chi_defining_atom_for_rotamer: Tensor[torch.int32][:, :],
+        chi_for_rotamers: Tensor[torch.float32][:, :],
+    ) -> None:
+        """Fill proton-chi samples in ``[n_rotamers, max_n_chi]`` tensors."""
         pbt = pose_stack.packed_block_types
         opth_cache = pbt.opth_sample_cache
 
@@ -785,6 +715,8 @@ class OptHSampler(ConformerSampler):
         for chi_col in range(n_chi_cols):
             n_samples = n_samples_per_chi[:, chi_col]
             active = n_samples > 0
+            # Skipping empty columns avoids launching several empty advanced-
+            # indexing kernels; this is faster than eliminating the sync.
             if not torch.any(active):
                 continue
 
@@ -811,13 +743,14 @@ class OptHSampler(ConformerSampler):
 
     def _fill_all_nhq_blocks(
         self,
-        pose_stack,
-        task,
-        gbt_for_rotamer,
-        pos_flip_chi,
-        chi_defining_atom_for_rotamer,
-        chi_for_rotamers,
-    ):
+        pose_stack: PoseStack,
+        task: "SetPackerTask",  # noqa: F821
+        gbt_for_rotamer: Tensor[torch.int32][:],
+        pos_flip_chi: Tensor[torch.float32][:, :],
+        chi_defining_atom_for_rotamer: Tensor[torch.int32][:, :],
+        chi_for_rotamers: Tensor[torch.float32][:, :],
+    ) -> None:
+        """Fill NHQ flip overrides in the per-rotamer chi tensors."""
         pbt = pose_stack.packed_block_types
         opth_cache = pbt.opth_sample_cache
 
@@ -825,27 +758,11 @@ class OptHSampler(ConformerSampler):
         rotamer_nhq_chi_col = opth_cache.nhq_chi_col[bt_for_rotamer]
         rotamer_is_flippable = rotamer_nhq_chi_col >= 0
         flippable_rotamers = torch.nonzero(rotamer_is_flippable, as_tuple=True)[0]
-        n_flippable_rotamers = flippable_rotamers.shape[0]
 
-        flipped_flippable_rotamers = (
-            2
-            * torch.arange(
-                n_flippable_rotamers / 2, dtype=torch.int64, device=pose_stack.device
-            )
-            + 1
-        )
-        flipped_rotamers = flippable_rotamers[flipped_flippable_rotamers]
-        is_flipped_flippable_rotamer = torch.zeros(
-            (n_flippable_rotamers,), dtype=torch.bool, device=pose_stack.device
-        )
-        is_flipped_flippable_rotamer[flipped_flippable_rotamers] = True
-        is_unflipped_flippable_rotamer = torch.ones(
-            (n_flippable_rotamers,), dtype=torch.bool, device=pose_stack.device
-        )
-        is_unflipped_flippable_rotamer[flipped_flippable_rotamers] = False
-        unflipped_flippable_rotamers = flippable_rotamers[
-            is_unflipped_flippable_rotamer
-        ]
+        # NHQ samples are emitted as adjacent (native, flipped) pairs. Slicing
+        # those pairs avoids constructing two full-length temporary masks.
+        unflipped_flippable_rotamers = flippable_rotamers[0::2]
+        flipped_rotamers = flippable_rotamers[1::2]
 
         flipped_rot_chi = rotamer_nhq_chi_col[flipped_rotamers]
         gbt_for_flipped_rotamer = gbt_for_rotamer[flipped_rotamers]
@@ -856,20 +773,14 @@ class OptHSampler(ConformerSampler):
         is_his_rotamer = opth_cache.is_his[bt_for_rotamer]
         is_orig_bt_rotamer = bt_for_rotamer == (
             pose_stack.block_type_ind64[
-                task.cons_bt_pose[gbt_for_rotamer], task.cons_bt_block[gbt_for_rotamer]
+                task.cons_bt_pose[gbt_for_rotamer],
+                task.cons_bt_block[gbt_for_rotamer],
             ]
         )
         is_his_taut_rotamer = torch.logical_and(is_his_rotamer, ~is_orig_bt_rotamer)
-        is_unflipped_rotamer = torch.zeros(
-            gbt_for_rotamer.shape[0], dtype=torch.bool, device=pose_stack.device
-        )
-        is_unflipped_rotamer[unflipped_flippable_rotamers] = True
-        is_his_taut_not_flipped_rotamer = torch.logical_and(
-            is_his_taut_rotamer, is_unflipped_rotamer
-        )
-        his_taut_not_flipped_rotamers = torch.nonzero(
-            is_his_taut_not_flipped_rotamer, as_tuple=True
-        )[0]
+        his_taut_not_flipped_rotamers = unflipped_flippable_rotamers[
+            is_his_taut_rotamer[unflipped_flippable_rotamers]
+        ]
         his_taut_not_flipped_rot_chi = rotamer_nhq_chi_col[
             his_taut_not_flipped_rotamers
         ]
@@ -913,14 +824,15 @@ class OptHSampler(ConformerSampler):
 
     def _fill_all_chi_tensors(
         self,
-        pose_stack,
-        task,
-        rot_offset_for_gbt,
-        gbt_for_rotamer,
-        pos_flip_chi,
-        chi_defining_atom_for_rotamer,
-        chi_for_rotamers,
-    ):
+        pose_stack: PoseStack,
+        task: "SetPackerTask",  # noqa: F821
+        rot_offset_for_gbt: Tensor[torch.int32][:],
+        gbt_for_rotamer: Tensor[torch.int32][:],
+        pos_flip_chi: Tensor[torch.float32][:, :],
+        chi_defining_atom_for_rotamer: Tensor[torch.int32][:, :],
+        chi_for_rotamers: Tensor[torch.float32][:, :],
+    ) -> None:
+        """Fill proton-chi and NHQ overrides into shared rotamer tensors."""
         self._fill_proton_chi_for_all_blocks(
             pose_stack,
             task,
@@ -942,7 +854,11 @@ class OptHSampler(ConformerSampler):
         self,
         pose_stack: PoseStack,
         task: "SetPackerTask",  # noqa: F821
-    ) -> Tuple[Tensor[torch.int32][:], Tensor[torch.int32][:], dict,]:
+    ) -> tuple[
+        Tensor[torch.int32][:],
+        Tensor[torch.int32][:],
+        dict[str, torch.Tensor],
+    ]:
         self._annotate_packed_block_types(pose_stack.packed_block_types)
 
         # ensure dunbrack and optH sampler are not _both_ specified for the same block
@@ -953,9 +869,8 @@ class OptHSampler(ConformerSampler):
         #      max chi tensor width
         #      current last-chi angle
         # for each NHQ position in the input
-        coords = pose_stack.coords.double()  # coord_dihedrals needs float64
         n_rots_for_gbt, max_n_chi_cols, pos_flip_chi = (
-            self._count_rots_and_measure_all_flips(pose_stack, task, coords)
+            self._count_rots_and_measure_all_flips(pose_stack, task)
         )
 
         n_rots_total = int(n_rots_for_gbt.sum().item())
@@ -973,11 +888,13 @@ class OptHSampler(ConformerSampler):
                 ),
             )
         rot_offset_for_gbt = exclusive_cumsum1d(n_rots_for_gbt)
+        # Reuse the synchronized total and keep the existing int32 indices.
         gbt_for_rotamer = torch.repeat_interleave(
             torch.arange(
                 n_rots_for_gbt.shape[0], dtype=torch.int32, device=pose_stack.device
             ),
-            n_rots_for_gbt.to(torch.int64),
+            n_rots_for_gbt,
+            output_size=n_rots_total,
         )
         chi_defining_atom_for_rotamer = torch.full(
             (n_rots_total, max_n_chi_cols),
@@ -1024,9 +941,9 @@ class OptHSampler(ConformerSampler):
         conf_inds_for_sampler: Tensor[torch.int64][:],
         sampler_n_rots_for_gbt: Tensor[torch.int32][:],
         sampler_gbt_for_rotamer: Tensor[torch.int32][:],
-        sample_dict: dict,
+        sample_dict: dict[str, torch.Tensor],
         conf_dofs_kto: Tensor[torch.float32][:, 9],
-    ):
+    ) -> None:
         if sampler_gbt_for_rotamer.shape[0] == 0:
             return
 

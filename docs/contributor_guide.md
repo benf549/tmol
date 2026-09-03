@@ -15,13 +15,13 @@ Two documentation forms serve different purposes:
 
 - `docs/workflows/` and selected `docs/user_guide/` pages are concise,
   reusable recipes that link to deeper material rather than reproducing it.
-- The top-level **Examples** section contains the eight interactive notebooks
+- The top-level **Examples** section contains the ten interactive notebooks
   in `docs/tutorial/`. They are deeper, executable walkthroughs rendered by
   nbsphinx.
 
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.5"
-pip install scikit-build-core pybind11 ninja packaging "cmake>=3.18,<4"
+pip install scikit-build-core pybind11 ninja packaging "cmake>=3.24,<4"
 TMOL_DISABLE_WHEEL_FETCH=1 \
   pip install --no-build-isolation -e ".[docs]" \
   -Ccmake.define.TMOL_ENABLE_CUDA=OFF

@@ -49,6 +49,20 @@ score = scorer(coords).sum()
 score.backward()
 ```
 
+## CPU batch throughput
+
+Whole-pose CPU scoring parallelizes independent poses through PyTorch's
+intra-op thread pool. Set the pool from the cores actually allocated to the
+process, and normally do not assign more scoring threads than poses:
+
+```python
+torch.set_num_threads(min(n_poses, allocated_physical_cores))
+```
+
+The pose boundary keeps gradients race-free, so a one-pose batch does not gain
+intra-pose parallelism. When several processes or data-loader workers score at
+once, divide the available cores between them to avoid oversubscription.
+
 ## Ligand-aware Scoring
 
 When a structure introduces ligand residue types at load time, the score
@@ -106,3 +120,32 @@ binding free energy or delta-delta G.
 any requested minimization. Use `return_pose_stack=True` when the refined
 coordinates are part of the result, and `sum_terms=False` to inspect score
 terms separately.
+
+## Fragmented-ligand attribution
+
+For a ligand represented by connected fragment blocks, attribute its
+interaction with an explicit partner mask in one connected-pose score:
+
+```python
+from tmol.score import calculate_fragment_interactions
+
+fragment_scores = calculate_fragment_interactions(
+    pose_stack,
+    protein_block_mask,
+    sfxn=sfxn,
+    sum_terms=False,
+)
+```
+
+`fragment_scores.scores` has shape
+`[n_terms, n_poses, n_fragments]`; set `sum_terms=True` for
+`[n_poses, n_fragments]`. The fragment columns follow
+`fragment_scores.mapping`. Every pose in the stack must use the same fragment
+block layout, and the partner mask must exclude those fragment blocks.
+
+Keep the fragments in one `PoseStack` and call this function once. It renders
+one block-pair scorer and reduces all fragment columns together, preserving
+autograd through the connected complex. Calling a complete scoring workflow
+once per fragment repeats scorer and kernel-launch overhead. Rebuilding
+separated fragment poses additionally changes the physical system by removing
+the connected multi-block context.
